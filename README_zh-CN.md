@@ -24,7 +24,7 @@
 
 ```
 EdgeOne Makers schedules (cron)
-        │  每小时 → POST /heartbeat
+        │  每天 03:00 → POST /heartbeat
         ▼
   ┌─────────────────────────────────────────┐
   │  heartbeat.ts  读状态/日志/记忆 → LLM     │
@@ -141,7 +141,7 @@ alive/
 
 设置 `ALIVE_AUTH_TOKEN` 可保护**面向用户**的端点：设置后 `/chat`、`/history`、`/stop` 需要 `Authorization: Bearer <token>`（精确、大小写敏感比较）。不设置或为空则全部开放——这是本地开发的默认状态。
 
-`/heartbeat` **刻意不做鉴权**：EdgeOne schedules 触发唤醒时不会携带 token，若在这里要求鉴权会静默掐断自主循环。代价是公开的 `/heartbeat` 可以被任何人 POST——成本仍然有界（每小时一次唤醒；纯思考回合几乎不碰沙箱），但确实允许任何人触发一次 LLM 调用。若要彻底关闭它，请删除 `edgeone.json` 中的 `schedules` 条目（agent 将不再被唤醒），或在函数前再加网关级认证。
+`/heartbeat` **刻意不做鉴权**：EdgeOne schedules 触发唤醒时不会携带 token，若在这里要求鉴权会静默掐断自主循环。代价是公开的 `/heartbeat` 可以被任何人 POST——成本仍然有界（免费版下每天一次唤醒；纯思考回合几乎不碰沙箱），但确实允许任何人触发一次 LLM 调用。若要彻底关闭它，请删除 `edgeone.json` 中的 `schedules` 条目（agent 将不再被唤醒），或在函数前再加网关级认证。
 
 开启 Token 鉴权后，请求形如：
 
@@ -199,12 +199,14 @@ curl https://<你的部署域名>/history?days=30 -H 'authorization: Bearer <tok
 
 | Cron        | 端点              | 含义                                                     |
 | ----------- | ----------------- | -------------------------------------------------------- |
-| `0 * * * *` | `POST /heartbeat` | 每小时 heartbeat，AI 自由发挥：思考/玩项目/整理记忆/休息 |
+| `0 3 * * *` | `POST /heartbeat` | 每天凌晨 3 点 heartbeat，AI 自由发挥：思考/玩项目/整理记忆/休息 |
 
-修改频率：编辑 `edgeone.json` 中的 `cron` 后重新 `edgeone makers deploy`。例如改为每 30 分钟一次：
+> 注意：Makers 免费版 schedules 最小间隔为 1 天（86400s），每小时 heartbeat 需要付费版，或由外部 cron（如 GitHub Actions）定时调用公开的 `/heartbeat` 端点。
+
+修改频率：编辑 `edgeone.json` 中的 `cron` 后重新 `edgeone makers deploy`。例如改为每天早晨 6 点：
 
 ```json
-{ "cron": "*/30 * * * *", "path": "/heartbeat", "method": "POST" }
+{ "name": "heartbeat", "cron": "0 6 * * *", "path": "/heartbeat", "method": "POST" }
 ```
 
 > schedules 只有 `/heartbeat` 一个；`/think`、`/dream`、`/play` 端点已随自由发挥改造移除。

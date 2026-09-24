@@ -1,7 +1,6 @@
 {
   "installCommand": "npm install",
   "buildCommand": "npm run build:makers",
-  "outputDirectory": "dist",
   "nodeVersion": "24",
   "agents": {
     "framework": "openai-sdk",
@@ -11,6 +10,6 @@
     }
   },
   "schedules": [
-    { "cron": "0 * * * *", "path": "/heartbeat", "method": "POST" }
+    { "name": "heartbeat", "cron": "0 3 * * *", "path": "/heartbeat", "method": "POST" }
   ]
 }

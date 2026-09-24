@@ -24,7 +24,7 @@ It is deliberately thin: each turn is a bounded LLM loop plus a little state I/O
 
 ```
 EdgeOne Makers schedules (cron)
-        │  every hour → POST /heartbeat
+        │  daily 03:00 → POST /heartbeat
         ▼
   ┌─────────────────────────────────────────┐
   │  heartbeat.ts  state/logs/memory → LLM  │
@@ -147,7 +147,7 @@ content, kind?)`, which writes the store row AND archives the same message
 
 Set `ALIVE_AUTH_TOKEN` to protect the **user-facing** endpoints: `/chat`, `/history` and `/stop` then require `Authorization: Bearer <token>` (exact, case-sensitive comparison). Unset or empty keeps everything open — the default for local development.
 
-`/heartbeat` is deliberately **not** gated: EdgeOne schedules wake the agent without carrying a token, so requiring auth there would silently kill the autonomous loop. The trade-off is that a public `/heartbeat` can be POSTed by anyone — cost stays bounded (one hourly wake; pure-thinking turns rarely touch the sandbox), but it does let anyone trigger a single LLM turn. If you need to lock it down completely, remove the `schedules` entry from `edgeone.json` (the agent simply stops waking) or place gateway-level auth in front of the whole function.
+`/heartbeat` is deliberately **not** gated: EdgeOne schedules wake the agent without carrying a token, so requiring auth there would silently kill the autonomous loop. The trade-off is that a public `/heartbeat` can be POSTed by anyone — cost stays bounded (one daily wake on the free plan; pure-thinking turns rarely touch the sandbox), but it does let anyone trigger a single LLM turn. If you need to lock it down completely, remove the `schedules` entry from `edgeone.json` (the agent simply stops waking) or place gateway-level auth in front of the whole function.
 
 With token auth on, requests look like:
 
@@ -204,12 +204,14 @@ The `schedules` field in `edgeone.json` defines the autonomous rhythm:
 
 | Cron        | Endpoint          | Meaning                                             |
 | ----------- | ----------------- | --------------------------------------------------- |
-| `0 * * * *` | `POST /heartbeat` | Hourly heartbeat; AI freely decides: think / tinker / organize / rest |
+| `0 3 * * *` | `POST /heartbeat` | Daily heartbeat at 03:00; AI freely decides: think / tinker / organize / rest |
 
-Change the frequency by editing `cron` in `edgeone.json` and re-deploying, e.g. every 30 minutes:
+> Note: the Makers free plan only allows schedules at a minimum interval of 1 day. Hourly heartbeat requires the paid plan or an external cron calling the public `/heartbeat` endpoint.
+
+Change the frequency by editing `cron` in `edgeone.json` and re-deploying. Example for a different daily time:
 
 ```json
-{ "cron": "*/30 * * * *", "path": "/heartbeat", "method": "POST" }
+{ "name": "heartbeat", "cron": "0 6 * * *", "path": "/heartbeat", "method": "POST" }
 ```
 
 > Only `/heartbeat` is scheduled. `/think`, `/dream`, `/play` were removed in the free-form refactor.
