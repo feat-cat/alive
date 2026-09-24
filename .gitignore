@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+out/
+
+# Environment (keep .env.example committed)
+.env
+.env.local
+.env.production
+.env.development
+
+# EdgeOne Makers local state
+.edgeone/
+
+# Tests / coverage
+coverage/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temp
+tmp/
+temp/
+*.tmp

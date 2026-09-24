@@ -1,0 +1,19 @@
+{
+  "name": "alive",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "EdgeOne Makers autonomous private agent kernel (heartbeat self-decision, memory, self growing in MEMORY.md).",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "build:makers": "npm run typecheck"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^6.0.0"
+  }
+}
