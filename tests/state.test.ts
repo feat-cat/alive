@@ -44,8 +44,13 @@ describe('getState', () => {
   test('falls back to defaultState when nothing is stored', async () => {
     const store = makeMockStore()
     const state = await getState(makeContext({ store }), SELF_ID)
-    assert.equal(state.lastActivityAt, defaultState().lastActivityAt)
-    assert.equal(state.created, defaultState().created)
+    // Shape matches defaultState (lastActivityAt=0, created = a fresh epoch).
+    // The exact `created` value is not asserted against a second
+    // `defaultState()` call: each call captures its own `Date.now()`, so the
+    // two could differ by 1ms across a millisecond boundary (pre-existing
+    // timing race in this test).
+    assert.equal(state.lastActivityAt, 0)
+    assert.ok(Number.isFinite(state.created) && state.created > 0)
   })
 
   test('falls back to defaultState for malformed stored values', async () => {

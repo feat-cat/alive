@@ -38,6 +38,25 @@ export interface LlmMessage {
   name?: string
 }
 
+/**
+ * The DeepSeek V4 gateway (via EdgeOne Makers `@makers/deepseek-v4-flash`)
+ * deserializes every request message with a Rust serde target type that
+ * REQUIRES a `name` field on non-system messages (observed live: 400
+ * `messages[1]: missing field name` on the first heartbeat trigger). Standard
+ * OpenAI clients only send `{ role, content }`, which the strict schema
+ * rejects. This normalizer guarantees every outbound non-system message has a
+ * participant `name` (role-derived), while system messages and messages that
+ * already carry a name (runtime `tool` results use the function name) pass
+ * through unchanged.
+ */
+export function withProviderMessageName(messages: LlmMessage[]): LlmMessage[] {
+  return messages.map((message) => {
+    if (message.role === 'system') return message
+    if (typeof message.name === 'string' && message.name.trim()) return message
+    return { ...message, name: message.role }
+  })
+}
+
 export interface ToolRunRecord {
   name: string
   args: Record<string, unknown>
@@ -149,9 +168,17 @@ async function singleCall(
   const onAbort = () => controller.abort()
   signal?.addEventListener('abort', onAbort, { once: true })
 
+  // DeepSeek V4's strict serde requires `name` on non-system messages; the
+  // heartbeat trigger / history rows restored by `loadMessages` only carry
+  // `{ role, content }`, which the live gateway rejected with 400
+  // `messages[1]: missing field name`. Normalize here so every upstream
+  // message is complete (system untouched, tool results keep their function
+  // name, user/assistant get a stable role-derived name).
+  const providerMessages = withProviderMessageName(messages)
+
   const body: Record<string, unknown> = {
     model: gateway.model,
-    messages,
+    messages: providerMessages,
     temperature,
     stream: false,
   }

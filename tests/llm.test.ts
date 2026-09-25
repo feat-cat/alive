@@ -6,11 +6,76 @@
 import { afterEach, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mock } from 'node:test'
-import { chatCompletion } from '../agents/_llm.ts'
+import { chatCompletion, withProviderMessageName, type LlmMessage } from '../agents/_llm.ts'
 import { gatewayEnv, makeContext } from './_helpers.ts'
 
 afterEach(() => {
   mock.restoreAll()
+})
+
+describe('withProviderMessageName (DeepSeek strict serde: messages[1] missing field name)', () => {
+  test('adds a role-derived name to user/assistant messages; system and tool pass through', () => {
+    const messages: LlmMessage[] = [
+      { role: 'system', content: 'system' },
+      { role: 'user', content: '[system][heartbeat] （heartbeat 醒来）此刻想做什么就做什么。' },
+      { role: 'assistant', content: 'assistant reply' },
+      { role: 'tool', tool_call_id: 'call_1', name: 'workspace_write', content: 'ok' },
+    ]
+    const normalized = withProviderMessageName(messages)
+    assert.deepEqual(normalized, [
+      { role: 'system', content: 'system' },
+      { role: 'user', content: '[system][heartbeat] （heartbeat 醒来）此刻想做什么就做什么。', name: 'user' },
+      { role: 'assistant', content: 'assistant reply', name: 'assistant' },
+      { role: 'tool', tool_call_id: 'call_1', name: 'workspace_write', content: 'ok' },
+    ])
+    // Original messages are not mutated.
+    assert.equal(Object.hasOwn(messages[1] ?? {}, 'name'), false)
+  })
+
+  test('keeps an explicit name and does not duplicate the field', () => {
+    const messages: LlmMessage[] = [
+      { role: 'user', content: 'hi', name: 'persona' },
+      { role: 'assistant', content: 'hey', name: 'assistant' },
+    ]
+    const normalized = withProviderMessageName(messages)
+    assert.equal(normalized[0]?.name, 'persona')
+    assert.equal(normalized[1]?.name, 'assistant')
+  })
+
+  test('every upstream message has a name for non-system roles (DeepSeek V4 requirement)', async () => {
+    // First heartbeat: system message + the just-persisted wake trigger only.
+    // loadMessages restores the trigger as { role:'user', content:'[system][heartbeat] ...' }
+    // with NO name field — the exact shape the deployed DeepSeek gateway rejected.
+    const messages: LlmMessage[] = [
+      { role: 'system', content: 'persona + DECISION_SYSTEM' },
+      { role: 'user', content: '[system][heartbeat] （heartbeat 醒来）此刻想做什么就做什么。' },
+    ]
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+
+    await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages,
+      maxTurns: 1,
+    })
+
+    assert.ok(bodies.length >= 1)
+    const sent = bodies[0]?.messages as Array<Record<string, unknown>>
+    assert.equal(sent[0]?.role, 'system')
+    assert.equal(sent[1]?.role, 'user')
+    // DeepSeek V4's serde requires `name` on the non-system trigger message.
+    assert.equal(sent[1]?.name, 'user')
+    assert.equal(typeof sent[1]?.content, 'string')
+    assert.equal(sent[1]?.tool_calls, undefined)
+    assert.equal(sent[1]?.tool_call_id, undefined)
+  })
 })
 
 function toolCallsResponse(...calls: Array<{ name: string; arguments: unknown }>): unknown {
