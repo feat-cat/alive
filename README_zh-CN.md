@@ -16,7 +16,7 @@
 - **纯思考 / 休息**——AI 只输出文字（内心日志、感受），零 sandbox 成本。这是最常见的路径。
 - **动手玩项目**——只有当 AI 主动调用 `workspace_*` 工具时才触沙箱，改动自动镜像回 Blob。
 - **整理记忆**——AI 用 `blob_*` 工具自由读写日记（`memory/daily/YYYY-MM-DD.md`）与长期笔记（`MEMORY.md`），想写就写，不做强制蒸馏。
-- **chat / stop / history**——对话、中止与历史归档端点（为未来 Matrix 接入准备）。chat 与 heartbeat 共用 `SELF_ID=eo-self` 同一份历史——AI 私下的思考与和用户的对话是一体的；同时 chat 也使用与 heartbeat 一致的**完整工具集**（blob + diary + chatlog + workspace + search），既能聊天也能动手干活；`/history` 从 Blob 读取完整、永不 compact 的 chatlog 归档。
+- **chat / stop / history**——对话、中止与历史归档端点（为未来 Matrix 接入准备）。`/chat` **默认 SSE 流式输出**（打字机效果，`text/event-stream`；见"Chat 流式"），并支持**图片输入**（`images[]` 传 base64 `data:` URL，模型不支持视觉时自动退化为纯文本——见"图片输入"）；chat 与 heartbeat 共用 `SELF_ID=eo-self` 同一份历史——AI 私下的思考与和用户的对话是一体的；同时 chat 也使用与 heartbeat 一致的**完整工具集**（blob + diary + chatlog + workspace + search），既能聊天也能动手干活；`/history` 从 Blob 读取完整、永不 compact 的 chatlog 归档。
 
 它刻意做得很"瘦"：每个回合只是有限次 LLM 调用 + 少量状态读写，因此在免费额度下可持续运行。
 
@@ -60,7 +60,7 @@ EdgeOne Makers schedules (cron)
 alive/
 ├── agents/                 # 全部运行时代码（Makers Functions 按端点加载）
 │   ├── _shared.ts          # 类型、常量、SSE、JSON 响应、错误映射、固定会话 id
-│   ├── _llm.ts             # AI Gateway chat/completions + 有界工具循环
+│   ├── _llm.ts             # AI Gateway chat/completions + 有界工具循环 + SSE 流式
 │   ├── _state.ts           # agent_state 读取/更新（仅 lastActivityAt/created）
 │   ├── _persona.ts         # 系统提示词构建（动态日期 + MEMORY.md "我的记忆"）
 │   ├── _memory.ts          # 四层记忆：store 上下文(auto-compact)、Blob 日记、MEMORY.md、chatlog 归档
@@ -70,7 +70,7 @@ alive/
 │   ├── _tavily.ts          # web_search（Tavily）执行器
 │   ├── _tools.ts           # heartbeat 完整工具注册表（blob + diary + chatlog + workspace + search）
 │   ├── heartbeat.ts        # POST /heartbeat（唯一主入口，AI 自由发挥）
-│   ├── chat.ts             # POST /chat（对话；完整工具集，与 heartbeat 一致）
+│   ├── chat.ts             # POST /chat（SSE 流式；完整工具集，与 heartbeat 一致）
 │   ├── history.ts          # GET /history（完整 chatlog 归档读取）
 │   └── stop.ts             # POST /stop（预留）
 ├── tests/                  # node:test 单元/端点测试
@@ -149,6 +149,39 @@ alive/
 curl -X POST https://<你的部署域名>/chat -H 'content-type: application/json' -H 'authorization: Bearer <token>' -d '{"message":"你好"}'
 curl https://<你的部署域名>/history?days=30 -H 'authorization: Bearer <token>'
 ```
+
+## Chat 流式（SSE 打字机效果）
+
+`POST /chat` **默认返回 Server-Sent Events**（`content-type: text/event-stream`，SSE）——回复逐 token 到达，而不是一次性 JSON：
+
+- **`ai_response`**——模型的每个文本增量是一条事件：
+  `{ "type": "ai_response", "content": "<增量>", "streamed": true }`（逐 token 重复，形成打字机效果）。
+- **工具场景退化**——流式调用同样携带**完整工具集**，agent 聊天时仍能动手。若模型决定调用工具，流式立即中止并退化为非流式工具循环；最终回复以**一条** `ai_response` 事件发出（`"streamed": false`）。
+- **`error_message`**——流中途失败（如网关 5xx）以 `{ "type": "error_message", "content": "<消息>" }` 事件送达。
+- 流总是以 `data: [DONE]` 结束（另有约 5s 一次的 `ping` 帧保持长连接/代理存活）。
+- **无论哪个分支，累积的完整回复都会落盘**到 store 历史 + chatlog 归档。
+
+仍想要旧的一次性 JSON 的客户端可显式 `?stream=false`（query）或 `{ "stream": false }`（body），返回原来的 `{ ok, reply, conversationId, now }` 封装。
+
+```bash
+# 打字机效果：`-N` 跟随输出，看到增量逐条到达
+curl -N -X POST https://<你的部署域名>/chat -H 'content-type: application/json' -d '{"message":"你好"}' \
+  | sed -n 's/^data: //p'
+```
+
+## 图片输入（多模态 + 视觉降级）
+
+`POST /chat` 支持在 `images[]` 字段传 base64 `data:` URL：
+
+```json
+{ "message": "看看这张图", "images": ["data:image/png;base64,..."] }
+```
+
+这条用户消息会以 OpenAI 多模态 content 数组发给 AI Gateway
+（`[{ "type":"text", "text":"..." }, { "type":"image_url", "image_url":{ "url": "data:image/png;base64,..." } }]`），
+并序列化落盘到历史（标记 `kind:'image-user'`；后续回合会把这个图片消息重新以 content 数组喂给支持视觉的模型）。
+
+**视觉降级。** `@makers/deepseek-v4-flash` 可能不支持图片输入。若网关返回错误文本包含 image / vision / multimodal 等关键词的 400，`/chat` 会**自动重试一次**：去掉图片，并在 system 提示词里追加说明（"用户发了一张图片但当前模型不支持视觉，请用文本回应"），同时把所有 content 数组还原成纯文本。与图片无关的 400 照常抛错。SSE 流式与 JSON（`?stream=false`）两条路径都支持降级。
 
 ## 部署步骤（EdgeOne Makers）
 
@@ -230,6 +263,7 @@ npm test            # node --test tests/*.test.ts（node:test，无需额外框�
 - **CORS 头已加，web 前端可跨域调用**：所有 `jsonOk`/`jsonError` 响应都带 `access-control-allow-origin: *` 及常见 preflight 头（`access-control-allow-methods: GET,POST,OPTIONS`、`access-control-allow-headers: content-type,authorization`），覆盖 `/chat`、`/history`、`/stop`、`/heartbeat`。`OPTIONS` preflight 由平台/边缘层处理——JSON 处理器本身不做特殊分支。
 - **apply_patch 模糊匹配取首个命中**：`seekSequence` 在多个可替换位置时替换第一个匹配（确定性优先于"猜测意图"）。
 - **未做 Web UI**：当前只有 HTTP 端点，没有管理界面。
+- **本地 node 代理尚未透传 SSE（下一步）**：`/chat` 现在默认 SSE 流式，但 `web/server.mjs` 仍整段读取上游 body 并按 JSON 转发。本地代理目前仍然可用（`?stream=false` 会得到 JSON 封装；SSE body 会原样透传），但要通过本地代理实现真正的打字机效果，需要把 `/api/chat` 改为 SSE 透传（`pipeline(upstream.body, res)` + `text/event-stream`）——计划作为紧接着的下一步。在此之前浏览器可直连云端 `/chat`（SSE 响应已带 CORS 头）。
 - **Matrix 接入预留**：`chat.ts` + `stop.ts` 已具备对话与中止能力，但尚未接入任何即时通讯协议。
 - **edgeone.json framework/outputDirectory（P2-8）**：Makers 平台配置待部署确认，暂不改动。
 - **无长期蒸馏策略**：`MEMORY.md` 由 AI 用 `blob_*` 自由读写（想写就写），不做全量 LLM 蒸馏；历史每次请求以标准 messages 数组注入，靠 auto-compact 折叠最旧 20% 控制长度（其余由网关上下文处理）。完整原始历史永不会丢——每条消息都以 append-only 方式归档进 `chatlog/`，可通过 `GET /history` 与 `chatlog_*` 工具查看。后续可升级为定期归纳日记为长期笔记。

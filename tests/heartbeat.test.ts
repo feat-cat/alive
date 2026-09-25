@@ -403,6 +403,47 @@ describe('POST /heartbeat', () => {
     assert.doesNotMatch(trigger?.content ?? '', /## 我的记忆/)
   })
 
+  test('heartbeat completes with an image-user history row as text — no base64 sent (P1)', async () => {
+    const store = makeMockStore({ [SELF_ID]: { [SELF_STATE_KEY]: defaultSelfState() } })
+    store.addMessage(SELF_ID, {
+      role: 'user',
+      content: JSON.stringify([
+        { type: 'text', text: '看看这张图' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
+      ]),
+      metadata: { kind: 'image-user', hasImage: true },
+    })
+    store.addMessage(SELF_ID, { role: 'assistant', content: '早前回复', metadata: { logKind: 'chat' } })
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    const context = withGatewayEnv(store)
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify(llmTextResponse('醒来，一切还好。')), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+
+    const result = await runHeartbeat(context)
+
+    assert.ok(result.text.includes('醒来，一切还好。'))
+    assert.ok(bodies.length >= 1)
+    const decision = bodies[0] as { messages: Array<{ role: string; content: unknown }> }
+    const all = JSON.stringify(decision.messages)
+    // The vision-less heartbeat must never forward the base64/image_url JSON
+    // (which would 400 on a vision-less gateway every wake-up).
+    assert.ok(!all.includes('image_url'))
+    assert.ok(!all.includes('data:image'))
+    assert.ok(!all.includes('base64'))
+    // The image row is still visible to the model as a text placeholder.
+    assert.ok(all.includes('「图片已发送」'))
+    assert.ok(all.includes('看看这张图'))
+    // The wake trigger is still present.
+    assert.ok(all.includes('heartbeat 醒来'))
+  })
+
   test('system prompt = dynamic wall clock + MEMORY.md self, no MOOD/ENERGY hints', async () => {
     const store = makeMockStore({ [SELF_ID]: { [SELF_STATE_KEY]: defaultSelfState() } })
     const blob = makeMockBlobStore({ 'memory/MEMORY.md': '# 我的记忆\n我是小蓝，喜欢安静地写代码。' })

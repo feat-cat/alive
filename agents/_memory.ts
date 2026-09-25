@@ -32,7 +32,7 @@ import {
   type MakersContext,
   type StoreMessage,
 } from './_shared.ts'
-import { chatCompletion, type LlmMessage, type ToolRunRecord } from './_llm.ts'
+import { chatCompletion, stripImageContent, type LlmContent, type LlmContentPart, type LlmMessage, type ToolRunRecord } from './_llm.ts'
 import { getBlobStore } from './_blob-tools.ts'
 
 const LOG_ROLE = 'assistant'
@@ -162,23 +162,93 @@ export const SYSTEM_HISTORY_GUIDANCE = [
  * originated rows get a `[system][...]` identity prefix so the model never
  * mistakes a heartbeat trigger or a compact summary for real user speech. Empty
  * messages and `system` rows are skipped; store failures degrade to `[]`.
+ *
+ * Multimodal rows: a chat user message that carried images is stored as a JSON
+ * string with `metadata.kind === 'image-user'`; it is restored here as a real
+ * content array (`image_url` parts included) so later turns still replay the
+ * picture to vision-capable models. Pass `{ stripImages: true }` to collapse
+ * those rows back to plain text instead — used by autonomous turns (heartbeat,
+ * compact) whose vision-less models must never receive a base64 JSON blob.
+ * Non-string store content is forwarded as-is.
  */
-export async function loadMessages(context: MakersContext, conversationId: string): Promise<LlmMessage[]> {
+export interface LoadMessagesOptions {
+  /**
+   * When true, image-bearing user rows (`kind:'image-user'`) are collapsed to
+   * plain text instead of being restored as multimodal content arrays. Without
+   * this, heartbeat/compact would forward the stored base64 JSON verbatim and
+   * a vision-less gateway would 400 on every autonomous turn.
+   */
+  stripImages?: boolean
+}
+
+export async function loadMessages(
+  context: MakersContext,
+  conversationId: string,
+  options: LoadMessagesOptions = {},
+): Promise<LlmMessage[]> {
   if (!context.store) return []
   try {
     const messages = await context.store.getMessages({ conversationId, limit: STORE_MESSAGE_LIMIT, order: 'asc' })
     const result: LlmMessage[] = []
     for (const message of messages) {
-      const content = message.content
-      if (!content || content.trim().length === 0) continue
       const role = toLlmRole(message.role)
       if (role === 'system') continue
-      result.push({ role, content: withSystemIdentity(message, content) })
+      const raw = message.content
+      if (raw === null || raw === undefined) continue
+      if (typeof raw !== 'string') {
+        // Platform may return a structured object directly (defensive).
+        result.push({ role, content: raw as LlmContent })
+        continue
+      }
+      if (!raw.trim()) continue
+      if (isImageUserMessage(message)) {
+        const parts = parseStoredContentArray(raw)
+        if (parts) {
+          result.push({ role, content: options.stripImages ? imageUserToText(parts) : parts })
+          continue
+        }
+      }
+      result.push({ role, content: withSystemIdentity(message, raw) })
     }
     return result
   } catch {
     return []
   }
+}
+
+/** Store marker for a chat user message that originally carried images. */
+const IMAGE_USER_KIND = 'image-user'
+
+/** True when a store row was written as an image-bearing chat user message. */
+export function isImageUserMessage(message: StoreMessage): boolean {
+  return (message.metadata as { kind?: unknown } | undefined)?.kind === IMAGE_USER_KIND
+}
+
+/** Try to restore a stored content-array JSON string back into parts. */
+export function parseStoredContentArray(raw: string): LlmContentPart[] | null {
+  const trimmed = raw.trim()
+  if (!trimmed.startsWith('[')) return null
+  try {
+    const parsed: unknown = JSON.parse(trimmed)
+    if (!Array.isArray(parsed)) return null
+    return parsed as LlmContentPart[]
+  } catch {
+    return null
+  }
+}
+
+/** Text placeholder when an image-bearing row is collapsed for text-only models. */
+const IMAGE_USER_PLACEHOLDER = '「图片已发送」'
+
+/**
+ * Collapse a restored image-user content array back to plain text while
+ * keeping the "user sent an image" semantics: the placeholder is always kept,
+ * with any accompanying text appended after it. A no-text row yields just the
+ * placeholder so the model still knows a picture was involved.
+ */
+function imageUserToText(parts: LlmContentPart[]): string {
+  const text = stripImageContent(parts, '').trim()
+  return text ? `${IMAGE_USER_PLACEHOLDER} ${text}` : IMAGE_USER_PLACEHOLDER
 }
 
 /**
@@ -337,6 +407,21 @@ const COMPACT_SYSTEM = [
 ].join('\n')
 
 /**
+ * Text for one store row in the compact prompt. Image-bearing user rows
+ * (kind:'image-user') are collapsed to their text parts with the image
+ * placeholder so the compaction LLM sees the conversation, not raw base64.
+ */
+function compactPromptText(message: StoreMessage): string {
+  const raw = message.content?.trim()
+  if (!raw) return ''
+  if (isImageUserMessage(message)) {
+    const parts = parseStoredContentArray(raw)
+    if (parts) return imageUserToText(parts)
+  }
+  return raw
+}
+
+/**
  * Auto-compact the context store. Runs only when usage >= COMPACT_TRIGGER;
  * folds the oldest COMPACT_OLD_RATIO messages into one summary message, then
  * deletes the originals. The summary is appended BEFORE any delete so a store
@@ -357,7 +442,9 @@ export async function maybeCompact(context: MakersContext, conversationId: strin
     const oldCount = Math.max(1, Math.floor(messages.length * COMPACT_OLD_RATIO))
     const oldest = messages.slice(0, oldCount)
     const deletable = oldest.filter((message): message is StoreMessage & { id: string } => Boolean(message.id))
-    const prompt = oldest.map((message) => message.content?.trim()).filter(Boolean).join('\n')
+    // Collapse image-bearing rows to text so the compaction LLM never receives
+    // a JSON string full of base64 (P2: the compact prompt must stay plain text).
+    const prompt = oldest.map(compactPromptText).filter(Boolean).join('\n')
     if (!prompt || deletable.length === 0) return { compacted: false, removedCount: 0, summary: '' }
 
     const result = await chatCompletion({

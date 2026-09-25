@@ -6,7 +6,7 @@
 import { afterEach, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mock } from 'node:test'
-import { chatCompletion, withProviderMessageName, type LlmMessage } from '../agents/_llm.ts'
+import { buildChatBody, chatCompletion, degradeVisionMessages, isVisionUnsupportedError, streamChatCompletion, StreamToolCallsError, stripImageContent, withProviderMessageName, type LlmMessage } from '../agents/_llm.ts'
 import { gatewayEnv, makeContext } from './_helpers.ts'
 
 afterEach(() => {
@@ -439,5 +439,246 @@ describe('chatCompletion tool arguments (P2-9)', () => {
 
     assert.deepEqual(received, { path: 'b.txt', n: 2 })
     assert.deepEqual(result.toolResults[0]?.args, { path: 'b.txt', n: 2 })
+  })
+})
+
+/* ------------------------------------------------------------------ */
+/* streamChatCompletion (SSE)                                          */
+/* ------------------------------------------------------------------ */
+
+function sseData(payload: unknown): string {
+  return `data: ${JSON.stringify(payload)}\n\n`
+}
+
+/** Mock AI Gateway SSE stream: whole frames as one response body. */
+function sseStreamResponse(chunks: string[]): Response {
+  const encoder = new TextEncoder()
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+      controller.close()
+    },
+  })
+  return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+}
+
+describe('streamChatCompletion (SSE)', () => {
+  test('calls onDelta with each content delta, accumulates full text, and stops at [DONE]', async () => {
+    const deltas: string[] = []
+    mock.method(globalThis, 'fetch', async () =>
+      sseStreamResponse([
+        sseData({ choices: [{ delta: { content: '你' } }] }),
+        sseData({ choices: [{ delta: { content: '好' } }] }),
+        sseData({ choices: [{ delta: { content: '呀' } }] }),
+        'data: [DONE]\n\n',
+      ]))
+
+    const result = await streamChatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: '你好' }],
+      onDelta: (delta) => deltas.push(delta),
+    })
+
+    assert.deepEqual(deltas, ['你', '好', '呀'])
+    assert.equal(result.text, '你好呀')
+  })
+
+  test('handles delta frames split across arbitrary byte boundaries and a stream that simply ends', async () => {
+    const raw = sseData({ choices: [{ delta: { content: 'hello' } }] })
+      + sseData({ choices: [{ delta: { content: ' world.' } }] })
+      + 'data: [DONE]\n\n'
+    const bytes = new TextEncoder().encode(raw)
+    const slices: Uint8Array[] = []
+    for (let i = 0; i < bytes.length; i += 7) slices.push(bytes.slice(i, i + 7))
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const slice of slices) controller.enqueue(slice)
+        controller.close()
+      },
+    })
+    mock.method(globalThis, 'fetch', async () => new Response(body, { status: 200 }))
+    const deltas: string[] = []
+    const result = await streamChatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'hi' }],
+      onDelta: (delta) => deltas.push(delta),
+    })
+    assert.deepEqual(deltas, ['hello', ' world.'])
+    assert.equal(result.text, 'hello world.')
+  })
+
+  test('request body carries stream:true plus strict-serif normalization and the tool wrapper', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return sseStreamResponse([sseData({ choices: [{ delta: { content: 'ok' } }] }), 'data: [DONE]\n\n'])
+    })
+
+    await streamChatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      onDelta: () => {},
+    })
+
+    assert.ok(bodies.length >= 1)
+    assert.equal(bodies[0]?.stream, true)
+    const sent = (bodies[0]?.messages as Array<Record<string, unknown>>)[0]
+    assert.equal(sent?.role, 'user')
+    assert.equal(sent?.name, 'user') // DeepSeek strict serde name normalization
+    assert.ok(Array.isArray(bodies[0]?.tools))
+    assert.equal(
+      ((bodies[0]?.tools as Array<{ function: { name: string } }>)[0])?.function.name,
+      'echo',
+    )
+  })
+
+  test('throws StreamToolCallsError when a delta requests tool calls (stream aborts to fallback)', async () => {
+    mock.method(globalThis, 'fetch', async () =>
+      sseStreamResponse([
+        sseData({ choices: [{ delta: { tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'echo', arguments: '{}' } }] } }] }),
+        'data: [DONE]\n\n',
+      ]))
+
+    await assert.rejects(
+      streamChatCompletion({
+        context,
+        conversationId: 'eo-test',
+        messages: [{ role: 'user', content: 'go' }],
+        onDelta: () => {},
+      }),
+      (error: unknown) => error instanceof StreamToolCallsError,
+    )
+  })
+
+  test('throws a descriptive error on a non-2xx response', async () => {
+    mock.method(globalThis, 'fetch', async () => new Response('boom', { status: 503 }))
+
+    await assert.rejects(
+      streamChatCompletion({
+        context,
+        conversationId: 'eo-test',
+        messages: [{ role: 'user', content: 'go' }],
+        onDelta: () => {},
+      }),
+      /AI gateway HTTP 503/,
+    )
+  })
+})
+
+describe('multimodal content (image parts)', () => {
+  const imageUrl = 'data:image/png;base64,AAAB'
+  const userImageMessage: LlmMessage = {
+    role: 'user',
+    content: [
+      { type: 'text', text: '看看这张图' },
+      { type: 'image_url', image_url: { url: imageUrl } },
+    ],
+  }
+
+  test('normalizer passes content arrays through verbatim and still adds a role-derived name', () => {
+    const normalized = withProviderMessageName([userImageMessage])
+    assert.equal(normalized.length, 1)
+    const out = normalized[0]
+    assert.equal(out?.role, 'user')
+    assert.equal(out?.name, 'user')
+    // The array must not be flattened or stringified.
+    assert.deepEqual(out?.content, [
+      { type: 'text', text: '看看这张图' },
+      { type: 'image_url', image_url: { url: imageUrl } },
+    ])
+  })
+
+  test('chatCompletion sends content arrays as OpenAI image_url parts', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify({ choices: [{ message: { content: '收到图片' } }] }), { status: 200 })
+    })
+
+    await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [userImageMessage],
+      maxTurns: 1,
+    })
+
+    assert.ok(bodies.length >= 1)
+    const sent = (bodies[0]?.messages as Array<{ role: string; content: unknown }>)[0]
+    assert.equal(sent?.role, 'user')
+    assert.deepEqual(sent?.content, [
+      { type: 'text', text: '看看这张图' },
+      { type: 'image_url', image_url: { url: imageUrl } },
+    ])
+  })
+
+  test('buildChatBody keeps string content untouched for plain messages', () => {
+    const gateway = { apiKey: 'k', baseUrl: 'https://gateway.test', model: 'm' }
+    const body = buildChatBody(
+      gateway,
+      [{ role: 'user', content: 'hi' }],
+      undefined,
+      0.6,
+      undefined,
+      false,
+    )
+    const sent = (body.messages as Array<{ role: string; content: unknown }>)[0]
+    assert.equal(sent?.content, 'hi')
+  })
+})
+
+describe('vision degradation helpers', () => {
+  test('isVisionUnsupportedError matches image/vision/multimodal error text', () => {
+    assert.equal(isVisionUnsupportedError(new Error('AI gateway HTTP 400: image_url is not supported by this model')), true)
+    assert.equal(isVisionUnsupportedError(new Error('AI gateway HTTP 400: this model does not support vision input')), true)
+    assert.equal(isVisionUnsupportedError(new Error('AI gateway HTTP 400: multimodal input is not supported')), true)
+    assert.equal(isVisionUnsupportedError(new Error('AI gateway HTTP 400: data:image content rejected')), true)
+    // Non-image errors must NOT trigger the degradation retry.
+    assert.equal(isVisionUnsupportedError(new Error('AI gateway HTTP 400: messages[1]: missing field name')), false)
+    // P2-6: the old broad `not support`/`image` pattern also matched unrelated
+    // errors; the converged regex must keep them out.
+    assert.equal(isVisionUnsupportedError(new Error('AI gateway HTTP 400: temperature not supported by this model')), false)
+    assert.equal(isVisionUnsupportedError(new Error('AI gateway HTTP 400: unsupported parameter "max_tokens"')), false)
+    assert.equal(isVisionUnsupportedError(new Error('AI gateway HTTP 503: upstream busy')), false)
+    // A vision token on a non-400 status must NOT trigger the retry either.
+    assert.equal(isVisionUnsupportedError(new Error('AI gateway HTTP 500: vision input failed')), false)
+  })
+
+  test('stripImageContent keeps plain text and collapses arrays to their text parts', () => {
+    assert.equal(stripImageContent('plain'), 'plain')
+    assert.equal(
+      stripImageContent([
+        { type: 'text', text: '标题' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AA' } },
+      ]),
+      '标题',
+    )
+    // Image-only content falls back to a placeholder.
+    assert.equal(
+      stripImageContent([{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA' } }]),
+      '（图片已省略，当前模型不支持视觉输入）',
+    )
+  })
+
+  test('degradeVisionMessages appends the system note and strips image parts everywhere else', () => {
+    const degraded = degradeVisionMessages([
+      { role: 'system', content: 'persona' },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: '看图' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AA' } },
+        ],
+      },
+      { role: 'assistant', content: '早前回复' },
+    ])
+    assert.match(degraded[0]?.content as string, /当前模型不支持视觉输入/)
+    // The image-bearing user row is back to text only.
+    assert.equal(degraded[1]?.content, '看图')
+    // Plain messages pass through untouched.
+    assert.equal(degraded[2]?.content, '早前回复')
   })
 })

@@ -113,10 +113,12 @@ describe('endpoint auth wiring', () => {
       JSON.stringify(llmTextResponse('你好呀，有什么可以帮你？')),
       { status: 200, headers: { 'content-type': 'application/json' } },
     ))
+    // stream:false keeps the JSON envelope so the reply can be asserted (the
+    // default streaming path returns SSE).
     const res = await chatOnRequest(makeContext({
       store,
       env: authedEnv('secret'),
-      body: { message: '你好' },
+      body: { message: '你好', stream: false },
       headers: { authorization: 'Bearer secret' },
     }))
     assert.equal(res.status, 200)

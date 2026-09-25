@@ -153,6 +153,64 @@ describe('maybeCompact', () => {
     assert.equal(store.logs.get(SELF_ID)?.length, 6000)
   })
 
+  test('compact prompt collapses image-user rows — no base64 reaches the compaction LLM (P1)', async () => {
+    const store = makeMockStore()
+    // Seed ordinary rows, THEN insert image-user rows so they fall inside the
+    // oldest COMPACT_OLD_RATIO slice, then top up to cross the trigger.
+    seedMessages(store, SELF_ID, 1000) // indices 0-999: ordinary
+    store.addMessage(SELF_ID, {
+      role: 'user',
+      content: JSON.stringify([
+        { type: 'text', text: '看看这张图' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
+      ]),
+      metadata: { kind: 'image-user', hasImage: true },
+    })
+    store.addMessage(SELF_ID, {
+      role: 'user',
+      content: JSON.stringify([
+        { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,BBBB' } },
+      ]),
+      metadata: { kind: 'image-user', hasImage: true },
+    })
+    store.addMessage(SELF_ID, {
+      role: 'user',
+      content: JSON.stringify([
+        { type: 'text', text: '纯文字附图' },
+        { type: 'image_url', image_url: { url: 'data:image/webp;base64,CCCCCC' } },
+      ]),
+      metadata: { kind: 'image-user', hasImage: true },
+    })
+    // indices 1003-5999 → total 6000 == COMPACT_TRIGGER usage.
+    seedMessages(store, SELF_ID, 4997)
+    const context = makeContext({ store, env: gatewayEnv() as Env })
+
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(
+        JSON.stringify(llmTextResponse('早期记录摘要。')),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    })
+
+    const result = await maybeCompact(context, SELF_ID)
+
+    assert.equal(result.compacted, true)
+    assert.ok(bodies.length >= 1)
+    const promptText = JSON.stringify(bodies[0])
+    // The compaction LLM must never see raw base64 or image_url JSON.
+    assert.ok(!promptText.includes('base64'))
+    assert.ok(!promptText.includes('image_url'))
+    assert.ok(!promptText.includes('data:image'))
+    // The image rows ARE included as text with the placeholder.
+    assert.ok(promptText.includes('「图片已发送」'))
+    assert.ok(promptText.includes('看看这张图'))
+    assert.ok(promptText.includes('纯文字附图'))
+    // Ordinary oldest rows are still part of the prompt.
+    assert.ok(promptText.includes('log-0'))
+  })
+
   test('delete failure after the summary write never loses history (summary appended first)', async () => {
     const store = makeMockStore()
     seedMessages(store, SELF_ID, 6000)
@@ -806,6 +864,72 @@ describe('loadMessages', () => {
     store.addMessage(SELF_ID, { role: 'assistant', content: '  ', metadata: {} })
     assert.deepEqual(await loadMessages(makeContext({ store }), SELF_ID), [])
     assert.deepEqual(await loadMessages(makeContext({}), SELF_ID), [])
+  })
+
+  test('restores image-user rows back into multimodal content arrays', async () => {
+    const store = makeMockStore()
+    const imageContent = [
+      { type: 'text', text: '看看这张图' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
+    ]
+    store.addMessage(SELF_ID, {
+      role: 'user',
+      content: JSON.stringify(imageContent),
+      metadata: { kind: 'image-user', hasImage: true },
+    })
+    store.addMessage(SELF_ID, { role: 'assistant', content: '抱歉，我不能直接看图。', metadata: { logKind: 'chat' } })
+
+    const messages = await loadMessages(makeContext({ store }), SELF_ID)
+
+    assert.deepEqual(messages, [
+      { role: 'user', content: imageContent },
+      { role: 'assistant', content: '抱歉，我不能直接看图。' },
+    ])
+  })
+
+  test('stripImages:true collapses image-user rows to text and keeps ordinary rows intact (P1)', async () => {
+    const store = makeMockStore()
+    store.addMessage(SELF_ID, {
+      role: 'user',
+      content: JSON.stringify([
+        { type: 'text', text: '看看这张图' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
+      ]),
+      metadata: { kind: 'image-user', hasImage: true },
+    })
+    store.addMessage(SELF_ID, {
+      role: 'user',
+      content: JSON.stringify([
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,BBB' } },
+      ]),
+      metadata: { kind: 'image-user', hasImage: true },
+    })
+    store.addMessage(SELF_ID, { role: 'user', content: '普通文本消息', metadata: {} })
+
+    const messages = await loadMessages(makeContext({ store }), SELF_ID, { stripImages: true })
+
+    // Image rows become plain text with the placeholder; no base64/JSON leaks.
+    assert.deepEqual(messages, [
+      { role: 'user', content: '「图片已发送」 看看这张图' },
+      { role: 'user', content: '「图片已发送」' },
+      { role: 'user', content: '普通文本消息' },
+    ])
+    const all = JSON.stringify(messages)
+    assert.ok(!all.includes('image_url'))
+    assert.ok(!all.includes('data:image'))
+    assert.ok(!all.includes('base64'))
+  })
+
+  test('treats a malformed image-user row as plain text instead of crashing', async () => {
+    const store = makeMockStore()
+    store.addMessage(SELF_ID, {
+      role: 'user',
+      content: 'broken][不是JSON',
+      metadata: { kind: 'image-user' },
+    })
+
+    const messages = await loadMessages(makeContext({ store }), SELF_ID)
+    assert.deepEqual(messages, [{ role: 'user', content: 'broken][不是JSON' }])
   })
 })
 

@@ -16,7 +16,7 @@ A minimal "agent with a self" skeleton:
 - **Pure thought / rest** — the AI just writes text (inner monologue, feelings) with zero sandbox cost. This is the most common path.
 - **Tinker with a project** — only when the AI actively calls `workspace_*` tools does it touch the sandbox; changes are auto-mirrored back to Blob.
 - **Organize memory** — the AI freely reads/writes its diary (`memory/daily/YYYY-MM-DD.md`) and long-term notes (`MEMORY.md`) via `blob_*` tools. No forced distillation.
-- **chat / stop / history** — conversation, abort and history-archive endpoints (reserved for future Matrix integration). chat shares `SELF_ID=eo-self` with heartbeat, so private thoughts and user conversations live in the same history stream; it also uses the **full tool registry like heartbeat** (blob + diary + chatlog + workspace + search), so the model can both chat and act; `/history` reads the complete, never-compacted chatlog archive from Blob.
+- **chat / stop / history** — conversation, abort and history-archive endpoints (reserved for future Matrix integration). `/chat` streams **SSE by default** (typewriter effect, `text/event-stream`; see "Chat streaming") and supports **image input** (base64 `data:` URLs in `images[]`, with automatic text-only degradation when the model lacks vision — see "Images"); it shares `SELF_ID=eo-self` with heartbeat, so private thoughts and user conversations live in the same history stream; it also uses the **full tool registry like heartbeat** (blob + diary + chatlog + workspace + search), so the model can both chat and act; `/history` reads the complete, never-compacted chatlog archive from Blob.
 
 It is deliberately thin: each turn is a bounded LLM loop plus a little state I/O, so it runs sustainably on the free tier.
 
@@ -61,7 +61,7 @@ EdgeOne Makers schedules (cron)
 alive/
 ├── agents/                 # All runtime code (loaded as Makers Functions endpoints)
 │   ├── _shared.ts          # Types, constants, SSE, JSON responses, error mapping, fixed ids
-│   ├── _llm.ts             # AI Gateway chat/completions + bounded tool loop
+│   ├── _llm.ts             # AI Gateway chat/completions + bounded tool loop + SSE streaming
 │   ├── _state.ts           # agent_state read/update (only lastActivityAt/created)
 │   ├── _persona.ts         # system-prompt builder (dynamic date + MEMORY.md "my memory")
 │   ├── _memory.ts          # four-tier memory: store context (auto-compact), Blob diary, MEMORY.md, chatlog archive
@@ -71,7 +71,7 @@ alive/
 │   ├── _tavily.ts          # web_search (Tavily) executor
 │   ├── _tools.ts           # heartbeat full tool registry (blob + diary + chatlog + workspace + search)
 │   ├── heartbeat.ts        # POST /heartbeat (the only main entry, free-form)
-│   ├── chat.ts             # POST /chat (conversation; full tool set like heartbeat)
+│   ├── chat.ts             # POST /chat (SSE streaming; full tool set like heartbeat)
 │   ├── history.ts          # GET /history (complete chatlog archive reader)
 │   └── stop.ts             # POST /stop (reserved)
 ├── tests/                  # node:test unit/endpoint tests
@@ -156,6 +156,57 @@ curl -X POST https://<your-deployed-domain>/chat -H 'content-type: application/j
 curl https://<your-deployed-domain>/history?days=30 -H 'authorization: Bearer <token>'
 ```
 
+## Chat streaming (SSE, typewriter effect)
+
+`POST /chat` streams **Server-Sent Events** (`content-type: text/event-stream`) by
+default — the reply appears token-by-token instead of as one JSON blob:
+
+- **`ai_response`** — each text delta from the model is sent as one event:
+  `{ "type": "ai_response", "content": "<delta>", "streamed": true }` (repeat for
+  every token, giving the typing effect).
+- **Tool degradation** — chat carries the **full tool registry** on the streaming
+  call too, so the agent can still act. If the model decides to call a tool the
+  stream is aborted and the agent falls back to the non-streaming tool loop; the
+  final answer is then delivered as **one** `ai_response` event with
+  `"streamed": false`.
+- **`error_message`** — a mid-stream failure (e.g. gateway 5xx) arrives as
+  `{ "type": "error_message", "content": "<message>" }` inside the stream.
+- The stream always ends with a `data: [DONE]` sentinel (plus a ~5s `ping` frame
+  keeps idle connections/proxies alive).
+- The **accumulated full reply is always persisted** to history + chatlog,
+  whichever branch ran.
+
+Clients that still want the old one-shot JSON can opt out explicitly with
+`?stream=false` (query) or `{ "stream": false }` (body); the response is then the
+original `{ ok, reply, conversationId, now }` envelope.
+
+```bash
+# Typewriter effect: pipe the SSE frames to see deltas as they arrive
+curl -N -X POST https://<your-deployed-domain>/chat -H 'content-type: application/json' -d '{"message":"hello"}' \
+  | sed -n 's/^data: //p'
+```
+
+## Images (multimodal input + vision degradation)
+
+`POST /chat` accepts images as base64 `data:` URLs in the `images[]` field:
+
+```json
+{ "message": "看看这张图", "images": ["data:image/png;base64,..."] }
+```
+
+The user turn is sent to the AI Gateway as an OpenAI multimodal content array
+(`[{ "type":"text", "text":"..." }, { "type":"image_url", "image_url":{ "url": "data:image/png;base64,..." } }]`)
+and persisted to history (serialized as JSON, tagged `kind:'image-user'`; later
+turns replay the picture to vision-capable models).
+
+**Vision degradation.** `@makers/deepseek-v4-flash` may not support image input.
+If the gateway rejects the request with a 400 whose text mentions image /
+vision / multimodal, `/chat` automatically retries **once** without images: the
+system prompt gains a note ("user sent a picture but the current model cannot
+see it — reply in text") and every content array is stripped back to text. A 400
+unrelated to images is surfaced as an error as usual. This works on both the SSE
+streaming path and the JSON (`?stream=false`) path.
+
 ## Deploying to EdgeOne Makers
 
 1. **Install & local checks**
@@ -235,6 +286,7 @@ Tests are fully mocked (in-memory store/sandbox/Blob, `globalThis.fetch` mocked 
 - **CORS headers are added, the web frontend can call the endpoints cross-origin:** every `jsonOk`/`jsonError` response carries `access-control-allow-origin: *` plus the common preflight headers (`access-control-allow-methods: GET,POST,OPTIONS`, `access-control-allow-headers: content-type,authorization`). This covers `/chat`, `/history`, `/stop` and `/heartbeat`. An `OPTIONS` preflight is still handled by the platform/edge layer — the JSON handlers themselves do not special-case it.
 - **apply_patch fuzzy match takes the first hit:** `seekSequence` replaces the first matching location (determinism over guessing intent).
 - **No web UI:** HTTP endpoints only.
+- **Local node proxy still buffers /chat as JSON (next step):** `/chat` now streams SSE, but `web/server.mjs` currently reads the upstream body fully and forwards it as JSON. The proxy still works (the JSON envelope is produced for `?stream=false`; the SSE body is passed through verbatim), but the real typewriter effect through the local proxy needs the SSE passthrough (`pipeline(upstream.body, res)` + `text/event-stream` content-type) — planned as the immediate next step. Browsers should connect to the cloud `/chat` directly (CORS is applied to the SSE response) until then.
 - **Matrix integration reserved:** `chat.ts` + `stop.ts` provide conversation & abort, but no IM protocol is wired yet.
 - **edgeone.json framework/outputDirectory (P2-8):** Makers platform config pending deployment confirmation.
 - **No long-term distillation strategy:** `MEMORY.md` is written freely by the AI (no forced full-LLM distillation); history is injected per request as a standard messages array, bounded by auto-compact folding the oldest 20% (plus the gateway's own context handling). The full original history is never lost, though — every message is archived append-only to `chatlog/` and reachable via `GET /history` + the `chatlog_*` tools. Periodic diary-to-notes summarization can be added later.
