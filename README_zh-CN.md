@@ -224,7 +224,7 @@ npm test            # node --test tests/*.test.ts（node:test，无需额外框�
 
 - **需真实部署验证**：sandbox 真实行为（配额/超时/镜像）、schedules 触发、Blob 真实 `getStore`、AI_GATEWAY 真实调用——本地测试均为 mock。
 - **`x-gateway-quota-bypass` 请求头待部署确认（P2-4）**：每次 AI Gateway 请求都带 `x-gateway-quota-bypass: true`（自 deepseek-harness 模板继承，供 Makers AI Gateway 识别）。真实网关是否需要此头尚未验证——部署时若不需要应删除 `agents/_llm.ts` 中的该 header 行。
-- **tools 格式已修复（OpenAI function 包装）**：发给 AI Gateway 的 tools 已按 OpenAI 标准包装为 `{ type: 'function', function: { name, description, parameters } }`。内部注册表保持扁平 `LlmToolDef`，仅发送时在 `_llm.ts` 转换；真实网关此前会因扁平结构返回 400（`tools[0].type is invalid or missing`）。
+- **tools + parameters 已按 OpenAI JSON Schema 包装**：发给 AI Gateway 的 tools 已包装为 `{ type: 'function', function: { name, description, parameters } }`，且 `parameters` 为完整 JSON Schema 对象（`{ type: 'object', properties, required }`；工具定义不区分必填/可选，因此 required 为全部参数键）。内部注册表保持扁平 `LlmToolDef`，仅发送时在 `_llm.ts` 转换；真实网关此前会因扁平结构返回 400（`tools[0].type is invalid or missing`），也会因裸属性对象参数返回 400（`got 'type': null`）。
 - **`store.state` 作用域待部署验证（V1）**：平台 `store.state` 是否按会话隔离需在真实 Makers Functions 中确认。代码按"两种模型都安全"实现：状态 key 为 `agent_state_self`，把 conversationId 显式传给 state get/set。
 - **可选 Token 鉴权（P1-2）已实现**：设置 `ALIVE_AUTH_TOKEN` 后 `/chat`、`/history`、`/stop` 需要 `Authorization: Bearer <token>`；`/heartbeat` 保持公开以便 schedules 唤醒它（见"可选 Token 鉴权"）。不设置则全部端点仍开放——公开部署前建议设置它，并/或在网关层加认证以覆盖 `/heartbeat` 在内。
 - **apply_patch 模糊匹配取首个命中**：`seekSequence` 在多个可替换位置时替换第一个匹配（确定性优先于"猜测意图"）。

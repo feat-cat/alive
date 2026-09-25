@@ -157,14 +157,22 @@ async function singleCall(
   }
   if (tools && tools.length > 0) {
     // OpenAI-compatible gateways require the { type: 'function', function:
-    // { name, description, parameters } } wrapper; the flat LlmToolDef registry
-    // shape would otherwise 400 (`tools[0].type is invalid or missing`).
+    // { name, description, parameters } } wrapper (the flat LlmToolDef registry
+    // shape would otherwise 400: `tools[0].type is invalid or missing`), AND
+    // `parameters` must be a complete JSON Schema — `{ type: 'object',
+    // properties, required }`. The bare property map would otherwise 400
+    // (`schema must be ... got 'type': null`). Tools don't distinguish
+    // required/optional, so all keys are required.
     body.tools = tools.map((tool) => ({
       type: 'function' as const,
       function: {
         name: tool.name,
         description: tool.description,
-        parameters: tool.parameters,
+        parameters: {
+          type: 'object',
+          properties: tool.parameters,
+          required: Object.keys(tool.parameters),
+        },
       },
     }))
   }
