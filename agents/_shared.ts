@@ -149,14 +149,31 @@ export function sseEvent(data: Record<string, unknown>): string {
   return `data: ${JSON.stringify(data)}\n\n`
 }
 
+/** Standard SSE end-of-stream sentinel: `data: [DONE]\n\n`. */
+export function sseDone(): string {
+  return 'data: [DONE]\n\n'
+}
+
+/**
+ * Wrap an async generator of SSE frames into a `text/event-stream` Response.
+ * A 5s `ping` frame keeps proxies from closing idle streams; generator errors
+ * become an `error_message` frame (AbortError / aborted signals are silent).
+ * A client disconnect (`cancel()`) sets an internal flag that stops the
+ * generator loop, and every `controller.enqueue` in the error path is wrapped
+ * in try/catch — an enqueue on an already-cancelled controller throws and must
+ * never escape the stream. CORS is applied like `jsonOk`/`jsonError` so a web
+ * frontend can consume the stream cross-origin.
+ */
 export function createSSEResponse(
   generator: (signal?: AbortSignal) => AsyncGenerator<string>,
   signal?: AbortSignal,
 ): Response {
   const encoder = new TextEncoder()
+  let cancelled = false
   const readableStream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const heartbeat = setInterval(() => {
+        if (cancelled) return
         try {
           controller.enqueue(encoder.encode(sseEvent({ type: 'ping', ts: Date.now() })))
         } catch {
@@ -165,13 +182,17 @@ export function createSSEResponse(
       }, 5_000)
       try {
         for await (const chunk of generator(signal)) {
-          if (signal?.aborted) break
+          if (signal?.aborted || cancelled) break
           controller.enqueue(encoder.encode(chunk))
         }
       } catch (error) {
         const err = error as Error
-        if (err.name !== 'AbortError' && !signal?.aborted) {
-          controller.enqueue(encoder.encode(sseEvent({ type: 'error_message', content: err.message })))
+        if (err.name !== 'AbortError' && !signal?.aborted && !cancelled) {
+          try {
+            controller.enqueue(encoder.encode(sseEvent({ type: 'error_message', content: err.message })))
+          } catch {
+            /* client disconnected while the error frame was enqueued */
+          }
         }
       } finally {
         clearInterval(heartbeat)
@@ -183,7 +204,7 @@ export function createSSEResponse(
       }
     },
     cancel() {
-      /* client disconnected */
+      cancelled = true
     },
   })
   return new Response(readableStream, {
@@ -193,6 +214,7 @@ export function createSSEResponse(
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
+      ...CORS_HEADERS,
     },
   })
 }

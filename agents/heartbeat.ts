@@ -139,7 +139,10 @@ export async function runHeartbeat(
     memoryContent: memory ? clampMemoryForContext(memory) : '',
   })
 
-  const history = await loadMessages(context, conversationId)
+  // Heartbeat is a TEXT-ONLY turn: image-user rows from past chats are
+  // collapsed back to their text parts so a vision-less model never receives a
+  // base64 content array and 400s every wake-up.
+  const history = await loadMessages(context, conversationId, { stripImages: true })
 
   // Short-turn budget: abort the LLM loop at PLAY_TURN_TIMEOUT_MS and when the
   // platform signal fires. The same signal is threaded into the tool registry
