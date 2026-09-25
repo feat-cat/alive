@@ -39,22 +39,78 @@ export interface LlmMessage {
 }
 
 /**
+ * OpenAI-standard tool_call entry as the DeepSeek V4 gateway's strict serde
+ * requires: each item carries `type: 'function'` and nests the flat
+ * `{ id, name, arguments }` inside `function: { name, arguments }`. Sending
+ * the flat shape 400s live with `messages[i]: missing field name`.
+ */
+export interface ProviderToolCall {
+  id: string
+  type: 'function'
+  function: {
+    name: string
+    arguments: string
+  }
+}
+
+/** Upstream wire message: name-normalized + tool_calls wrapped. */
+export interface ProviderMessage {
+  role: LlmMessage['role']
+  content: string
+  tool_calls?: ProviderToolCall[]
+  tool_call_id?: string
+  name?: string
+}
+
+/**
  * The DeepSeek V4 gateway (via EdgeOne Makers `@makers/deepseek-v4-flash`)
  * deserializes every request message with a Rust serde target type that
  * REQUIRES a `name` field on non-system messages (observed live: 400
- * `messages[1]: missing field name` on the first heartbeat trigger). Standard
- * OpenAI clients only send `{ role, content }`, which the strict schema
- * rejects. This normalizer guarantees every outbound non-system message has a
- * participant `name` (role-derived), while system messages and messages that
- * already carry a name (runtime `tool` results use the function name) pass
- * through unchanged.
+ * `messages[1]: missing field name` on the first heartbeat trigger) and an
+ * OpenAI-standard `tool_calls` array (flat `{ id, name, arguments }` items
+ * 400 with `missing field name` too). Standard OpenAI clients only send
+ * `{ role, content }`, which the strict schema rejects. This normalizer
+ * guarantees every outbound message is complete: non-system messages get a
+ * participant `name` (role-derived), assistant `tool_calls` are wrapped into
+ * `{ id, type: 'function', function: { name, arguments } }`, and system
+ * messages / messages that already carry a name (runtime `tool` results use
+ * the function name) pass through their fields unchanged.
  */
-export function withProviderMessageName(messages: LlmMessage[]): LlmMessage[] {
-  return messages.map((message) => {
-    if (message.role === 'system') return message
-    if (typeof message.name === 'string' && message.name.trim()) return message
-    return { ...message, name: message.role }
-  })
+export function withProviderMessageName(messages: LlmMessage[]): ProviderMessage[] {
+  return messages.map(normalizeOutboundMessage)
+}
+
+/**
+ * Wrap a flat `LlmToolCall` into the OpenAI-standard tool_call entry. `arguments`
+ * is already a JSON string for most gateways; an object is stringified here.
+ */
+export function toStandardToolCalls(toolCalls: LlmToolCall[] | undefined): ProviderToolCall[] {
+  if (!toolCalls || toolCalls.length === 0) return []
+  return toolCalls.map((call) => ({
+    id: call.id,
+    type: 'function' as const,
+    function: {
+      name: call.name,
+      arguments: typeof call.arguments === 'string' ? call.arguments : JSON.stringify(call.arguments),
+    },
+  }))
+}
+
+/**
+ * Normalize one outbound message for the strict gateway: add a role-derived
+ * `name` to non-system messages that lack one, and wrap assistant `tool_calls`
+ * into the OpenAI standard shape. The field is omitted entirely when the
+ * message has no tool calls.
+ */
+export function normalizeOutboundMessage(message: LlmMessage): ProviderMessage {
+  const hasName = typeof message.name === 'string' && message.name.trim().length > 0
+  const name = hasName ? message.name : message.role === 'system' ? undefined : message.role
+  const out: ProviderMessage = { role: message.role, content: message.content }
+  if (name !== undefined) out.name = name
+  if (message.tool_call_id !== undefined) out.tool_call_id = message.tool_call_id
+  const toolCalls = toStandardToolCalls(message.tool_calls)
+  if (toolCalls.length > 0) out.tool_calls = toolCalls
+  return out
 }
 
 export interface ToolRunRecord {
@@ -168,13 +224,15 @@ async function singleCall(
   const onAbort = () => controller.abort()
   signal?.addEventListener('abort', onAbort, { once: true })
 
-  // DeepSeek V4's strict serde requires `name` on non-system messages; the
+  // DeepSeek V4's strict serde requires `name` on non-system messages (the
   // heartbeat trigger / history rows restored by `loadMessages` only carry
   // `{ role, content }`, which the live gateway rejected with 400
-  // `messages[1]: missing field name`. Normalize here so every upstream
-  // message is complete (system untouched, tool results keep their function
-  // name, user/assistant get a stable role-derived name).
-  const providerMessages = withProviderMessageName(messages)
+  // `messages[1]: missing field name`) and OpenAI-standard `tool_calls` items
+  // (flat `{ id, name, arguments }` would 400 with `missing field name` too).
+  // Normalize every message here so the upstream payload is complete: system
+  // untouched, tool results keep their function name, user/assistant get a
+  // stable role-derived name, and assistant tool_calls are wrapped.
+  const providerMessages = messages.map(normalizeOutboundMessage)
 
   const body: Record<string, unknown> = {
     model: gateway.model,

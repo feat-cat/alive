@@ -42,6 +42,21 @@ describe('withProviderMessageName (DeepSeek strict serde: messages[1] missing fi
     assert.equal(normalized[1]?.name, 'assistant')
   })
 
+  test('wraps assistant tool_calls into OpenAI standard shape alongside the role-derived name', () => {
+    const messages: LlmMessage[] = [
+      { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', name: 'echo', arguments: { n: 1 } }] },
+    ]
+    const normalized = withProviderMessageName(messages)
+    assert.deepEqual(normalized, [
+      {
+        role: 'assistant',
+        content: '',
+        name: 'assistant',
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'echo', arguments: '{"n":1}' } }],
+      },
+    ])
+  })
+
   test('every upstream message has a name for non-system roles (DeepSeek V4 requirement)', async () => {
     // First heartbeat: system message + the just-persisted wake trigger only.
     // loadMessages restores the trigger as { role:'user', content:'[system][heartbeat] ...' }
@@ -280,6 +295,100 @@ describe('chatCompletion OpenAI tool schema (P2-11)', () => {
 
     assert.ok(bodies.length >= 1)
     assert.ok(!('tools' in (bodies[0] ?? {})), 'body.tools must be absent when no tools are configured')
+  })
+})
+
+describe('chatCompletion assistant tool_calls wrapping (bug #3)', () => {
+  test('sends assistant tool_calls as OpenAI standard { id, type, function } with string arguments', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      fetchCalls += 1
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      if (fetchCalls === 1) {
+        return new Response(
+          JSON.stringify(toolCallsResponse({ name: 'echo', arguments: JSON.stringify({ path: 'a.txt' }) })),
+          { status: 200 },
+        )
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'done' } }] }), { status: 200 })
+    })
+
+    await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      toolRunner: async () => ({ content: 'ok' }),
+      maxTurns: 2,
+    })
+
+    assert.ok(bodies.length >= 2)
+    const sent = bodies[1]?.messages as Array<Record<string, unknown>>
+    const assistant = sent.find((message) => message?.role === 'assistant')
+    assert.ok(assistant, 'second request carries the assistant tool_calls message')
+    // The flat LlmToolCall must be wrapped so the gateway serde can read
+    // `function.name`; otherwise the live 400 is `messages[i]: missing field name`.
+    assert.deepEqual(assistant.tool_calls, [
+      { id: 'call_1', type: 'function', function: { name: 'echo', arguments: JSON.stringify({ path: 'a.txt' }) } },
+    ])
+    // Name normalization still applies to the assistant message.
+    assert.equal(assistant.name, 'assistant')
+  })
+
+  test('stringifies object arguments into the wrapped tool_call', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      fetchCalls += 1
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      if (fetchCalls === 1) {
+        return new Response(
+          JSON.stringify(toolCallsResponse({ name: 'echo', arguments: { path: 'b.txt', n: 2 } })),
+          { status: 200 },
+        )
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'done' } }] }), { status: 200 })
+    })
+
+    await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      toolRunner: async () => ({ content: 'ok' }),
+      maxTurns: 2,
+    })
+
+    assert.ok(bodies.length >= 2)
+    const sent = bodies[1]?.messages as Array<Record<string, unknown>>
+    const assistant = sent.find((message) => message?.role === 'assistant')
+    assert.ok(assistant, 'second request carries the assistant tool_calls message')
+    assert.deepEqual(assistant.tool_calls, [
+      { id: 'call_1', type: 'function', function: { name: 'echo', arguments: '{"path":"b.txt","n":2}' } },
+    ])
+  })
+
+  test('omits the tool_calls field entirely when a message has none', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'plain reply' } }] }), { status: 200 })
+    })
+
+    await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'hi' }],
+      maxTurns: 1,
+    })
+
+    assert.ok(bodies.length >= 1)
+    const sent = bodies[0]?.messages as Array<Record<string, unknown>>
+    for (const message of sent) {
+      assert.equal(message?.tool_calls, undefined)
+      assert.equal(message?.tool_call_id, undefined)
+    }
   })
 })
 
