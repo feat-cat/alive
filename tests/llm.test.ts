@@ -127,6 +127,54 @@ describe('chatCompletion final turn (P2-2)', () => {
   })
 })
 
+describe('chatCompletion OpenAI tool schema (P2-11)', () => {
+  test('sends tools wrapped as { type: "function", function: { name, description, parameters } }', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify(toolCallsResponse({ name: 'echo', arguments: '{}' })), { status: 200 })
+    })
+
+    await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      toolRunner: async () => ({ content: 'ok' }),
+      maxTurns: 1,
+    })
+
+    assert.ok(bodies.length >= 1)
+    // The real AI Gateway 400s on the flat { name, description, parameters }
+    // shape (`tools[0].type is invalid or missing`), so assert the exact
+    // OpenAI-compatible wrapper that `singleCall` sends.
+    assert.deepEqual(bodies[0]?.tools, [
+      {
+        type: 'function',
+        function: { name: 'echo', description: 'echo args back', parameters: {} },
+      },
+    ])
+  })
+
+  test('omits the tools key when no tools are provided', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify(toolCallsResponse()), { status: 200 })
+    })
+
+    await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      maxTurns: 1,
+    })
+
+    assert.ok(bodies.length >= 1)
+    assert.ok(!('tools' in (bodies[0] ?? {})), 'body.tools must be absent when no tools are configured')
+  })
+})
+
 describe('chatCompletion tool arguments (P2-9)', () => {
   test('accepts arguments sent as a JSON string', async () => {
     mock.method(globalThis, 'fetch', async () =>
