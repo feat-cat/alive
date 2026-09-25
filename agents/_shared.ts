@@ -257,16 +257,27 @@ export function requireAuth(context: MakersContext): Response | null {
   return jsonError(401, 'Unauthorized')
 }
 
+/**
+ * Common CORS headers on every JSON response so the web frontend can call the
+ * endpoints cross-origin. The object is shared (const, never mutated) — jsonOk
+ * and jsonError both spread it into a fresh headers map per response.
+ */
+const CORS_HEADERS = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-methods': 'GET,POST,OPTIONS',
+  'access-control-allow-headers': 'content-type,authorization',
+} as const
+
 export function jsonError(status: number, message: string, extra?: Record<string, unknown>): Response {
   return Response.json({ ok: false, error: message, ...extra }, {
     status,
-    headers: { 'cache-control': 'no-store' },
+    headers: { 'cache-control': 'no-store', ...CORS_HEADERS },
   })
 }
 
 export function jsonOk(payload: Record<string, unknown>): Response {
   return Response.json({ ok: true, ...payload }, {
-    headers: { 'cache-control': 'no-store' },
+    headers: { 'cache-control': 'no-store', ...CORS_HEADERS },
   })
 }
 

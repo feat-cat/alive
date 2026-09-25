@@ -227,6 +227,7 @@ npm test            # node --test tests/*.test.ts（node:test，无需额外框�
 - **tools + tool_calls 均已按 OpenAI 标准包装**：发给 AI Gateway 的 tools 已包装为 `{ type: 'function', function: { name, description, parameters } }`，assistant 消息里的 tool_calls 也包装为 `{ id, type: 'function', function: { name, arguments } }`，且 `parameters` 为完整 JSON Schema 对象（`{ type: 'object', properties, required }`；工具定义不区分必填/可选，因此 required 为全部参数键）。内部注册表与消息保持扁平 `LlmToolDef` / `LlmToolCall`，仅发送时在 `_llm.ts` 用 `normalizeOutboundMessage` 统一归一化（补 name + 包装 tool_calls）；真实网关此前会因扁平结构返回 400（`tools[0].type is invalid or missing`、`messages[i]: missing field name`），也会因裸属性对象参数返回 400（`got 'type': null`）。
 - **`store.state` 作用域待部署验证（V1）**：平台 `store.state` 是否按会话隔离需在真实 Makers Functions 中确认。代码按"两种模型都安全"实现：状态 key 为 `agent_state_self`，把 conversationId 显式传给 state get/set。
 - **可选 Token 鉴权（P1-2）已实现**：设置 `ALIVE_AUTH_TOKEN` 后 `/chat`、`/history`、`/stop` 需要 `Authorization: Bearer <token>`；`/heartbeat` 保持公开以便 schedules 唤醒它（见"可选 Token 鉴权"）。不设置则全部端点仍开放——公开部署前建议设置它，并/或在网关层加认证以覆盖 `/heartbeat` 在内。
+- **CORS 头已加，web 前端可跨域调用**：所有 `jsonOk`/`jsonError` 响应都带 `access-control-allow-origin: *` 及常见 preflight 头（`access-control-allow-methods: GET,POST,OPTIONS`、`access-control-allow-headers: content-type,authorization`），覆盖 `/chat`、`/history`、`/stop`、`/heartbeat`。`OPTIONS` preflight 由平台/边缘层处理——JSON 处理器本身不做特殊分支。
 - **apply_patch 模糊匹配取首个命中**：`seekSequence` 在多个可替换位置时替换第一个匹配（确定性优先于"猜测意图"）。
 - **未做 Web UI**：当前只有 HTTP 端点，没有管理界面。
 - **Matrix 接入预留**：`chat.ts` + `stop.ts` 已具备对话与中止能力，但尚未接入任何即时通讯协议。
