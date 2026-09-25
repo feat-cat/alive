@@ -448,23 +448,4 @@ export function buildTools(tc: ToolContext): ToolRegistry {
   return { definitions, run }
 }
 
-/** Registry with only web search (used by chat when desired). */
-export function buildSearchOnlyTools(tc: ToolContext): ToolRegistry {
-  return {
-    definitions: [SEARCH_TOOL].map((entry) => ({
-      name: entry.name,
-      description: entry.description,
-      parameters: entry.parameters,
-    })),
-    run: async (name, args, signal) => {
-      if (signal?.aborted || tc.signal?.aborted) {
-        const abort = new Error('Tool execution aborted')
-        abort.name = 'AbortError'
-        throw abort
-      }
-      return name === SEARCH_TOOL.name
-        ? SEARCH_TOOL.run(tc, args)
-        : { content: `Unknown tool: ${name}.`, isError: true }
-    },
-  }
-}
+

@@ -16,7 +16,7 @@
 - **纯思考 / 休息**——AI 只输出文字（内心日志、感受），零 sandbox 成本。这是最常见的路径。
 - **动手玩项目**——只有当 AI 主动调用 `workspace_*` 工具时才触沙箱，改动自动镜像回 Blob。
 - **整理记忆**——AI 用 `blob_*` 工具自由读写日记（`memory/daily/YYYY-MM-DD.md`）与长期笔记（`MEMORY.md`），想写就写，不做强制蒸馏。
-- **chat / stop / history**——对话、中止与历史归档端点（为未来 Matrix 接入准备）。chat 与 heartbeat 共用 `SELF_ID=eo-self` 同一份历史——AI 私下的思考与和用户的对话是一体的；`/history` 从 Blob 读取完整、永不 compact 的 chatlog 归档。
+- **chat / stop / history**——对话、中止与历史归档端点（为未来 Matrix 接入准备）。chat 与 heartbeat 共用 `SELF_ID=eo-self` 同一份历史——AI 私下的思考与和用户的对话是一体的；同时 chat 也使用与 heartbeat 一致的**完整工具集**（blob + diary + chatlog + workspace + search），既能聊天也能动手干活；`/history` 从 Blob 读取完整、永不 compact 的 chatlog 归档。
 
 它刻意做得很"瘦"：每个回合只是有限次 LLM 调用 + 少量状态读写，因此在免费额度下可持续运行。
 
@@ -70,7 +70,7 @@ alive/
 │   ├── _tavily.ts          # web_search（Tavily）执行器
 │   ├── _tools.ts           # heartbeat 完整工具注册表（blob + diary + chatlog + workspace + search）
 │   ├── heartbeat.ts        # POST /heartbeat（唯一主入口，AI 自由发挥）
-│   ├── chat.ts             # POST /chat（预留）
+│   ├── chat.ts             # POST /chat（对话；完整工具集，与 heartbeat 一致）
 │   ├── history.ts          # GET /history（完整 chatlog 归档读取）
 │   └── stop.ts             # POST /stop（预留）
 ├── tests/                  # node:test 单元/端点测试

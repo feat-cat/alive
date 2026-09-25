@@ -4,7 +4,8 @@
  * Flow: append user message → build a persona (wall clock + MEMORY.md "self")
  * → feed the model a STANDARD messages array: [system(persona), ...history]
  * where history comes straight from the store via `loadMessages` (including the
- * just-appended user message) → bounded chatCompletion (search-only tools) →
+ * just-appended user message) → bounded chatCompletion with the full tool
+ * registry (blob + diary + chatlog + workspace + search, same as heartbeat) →
  * persist any tool calls as `kind:'tool'` records → append assistant reply.
  *
  * Heartbeat and chat share the fixed SELF_ID conversation, so private thoughts
@@ -31,21 +32,9 @@ import {
   recordToolCalls,
   SYSTEM_HISTORY_GUIDANCE,
 } from './_memory.ts'
-import { buildSearchOnlyTools } from './_tools.ts'
+import { buildTools } from './_tools.ts'
 
 const CHAT_MAX_TURNS = 3
-
-/**
- * Tool availability note appended to the chat system prompt. This endpoint only
- * registers `web_search`; the diary / chatlog / MEMORY.md read-write tools
- * (`diary_*`, `chatlog_*`, `blob_*`, `workspace_*`) are NOT available here, so
- * the model must never call them even when MEMORY.md's birth seed mentions them.
- */
-const CHAT_TOOLS_GUIDANCE = [
-  '此会话只有 web_search 一个工具可用。',
-  '日记/聊天记录/MEMORY.md 的读写工具（diary_*、chatlog_*、blob_*、workspace_*）不在此会话提供；',
-  '如需写日记或翻聊天记录，请通过 heartbeat 或直接改 Blob。',
-].join('\n')
 
 export type ChatResult = {
   reply: string
@@ -77,16 +66,19 @@ export async function runChat(
   // message (appended above), so it flows to the model as its own entry.
   const history = await loadMessages(context, conversationId)
 
-  const searchTools = buildSearchOnlyTools({ context, conversationId })
+  // Full tool registry like heartbeat: the model can chat AND act (blob_*,
+  // diary_*, chatlog_*, workspace_*, web_search). No 100s turn budget here —
+  // only the request AbortSignal bounds the loop/tools.
+  const tools = buildTools({ context, conversationId, signal: options.signal })
   const result = await chatCompletion({
     context,
     conversationId,
     messages: [
-      { role: 'system', content: `${persona}\n\n${SYSTEM_HISTORY_GUIDANCE}\n\n${CHAT_TOOLS_GUIDANCE}` },
+      { role: 'system', content: `${persona}\n\n${SYSTEM_HISTORY_GUIDANCE}` },
       ...history,
     ],
-    tools: searchTools.definitions,
-    toolRunner: searchTools.run,
+    tools: tools.definitions,
+    toolRunner: tools.run,
     maxTurns: CHAT_MAX_TURNS,
     signal: options.signal,
     temperature: 0.7,

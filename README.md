@@ -16,7 +16,7 @@ A minimal "agent with a self" skeleton:
 - **Pure thought / rest** — the AI just writes text (inner monologue, feelings) with zero sandbox cost. This is the most common path.
 - **Tinker with a project** — only when the AI actively calls `workspace_*` tools does it touch the sandbox; changes are auto-mirrored back to Blob.
 - **Organize memory** — the AI freely reads/writes its diary (`memory/daily/YYYY-MM-DD.md`) and long-term notes (`MEMORY.md`) via `blob_*` tools. No forced distillation.
-- **chat / stop / history** — conversation, abort and history-archive endpoints (reserved for future Matrix integration). chat shares `SELF_ID=eo-self` with heartbeat, so private thoughts and user conversations live in the same history stream; `/history` reads the complete, never-compacted chatlog archive from Blob.
+- **chat / stop / history** — conversation, abort and history-archive endpoints (reserved for future Matrix integration). chat shares `SELF_ID=eo-self` with heartbeat, so private thoughts and user conversations live in the same history stream; it also uses the **full tool registry like heartbeat** (blob + diary + chatlog + workspace + search), so the model can both chat and act; `/history` reads the complete, never-compacted chatlog archive from Blob.
 
 It is deliberately thin: each turn is a bounded LLM loop plus a little state I/O, so it runs sustainably on the free tier.
 
@@ -71,7 +71,7 @@ alive/
 │   ├── _tavily.ts          # web_search (Tavily) executor
 │   ├── _tools.ts           # heartbeat full tool registry (blob + diary + chatlog + workspace + search)
 │   ├── heartbeat.ts        # POST /heartbeat (the only main entry, free-form)
-│   ├── chat.ts             # POST /chat (reserved)
+│   ├── chat.ts             # POST /chat (conversation; full tool set like heartbeat)
 │   ├── history.ts          # GET /history (complete chatlog archive reader)
 │   └── stop.ts             # POST /stop (reserved)
 ├── tests/                  # node:test unit/endpoint tests

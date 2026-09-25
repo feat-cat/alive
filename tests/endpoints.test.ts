@@ -95,7 +95,7 @@ describe('POST /chat', () => {
     assert.equal(store.messageLog.at(-1)?.role, 'assistant')
   })
 
-  test('system prompt tells the model only web_search is available in chat', async () => {
+  test('chat registers the full tool set (blob + workspace + diary + chatlog + web_search)', async () => {
     const store = makeMockStore()
     const bodies: Array<Record<string, unknown>> = []
     mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
@@ -114,12 +114,20 @@ describe('POST /chat', () => {
 
     assert.equal(res.status, 200)
     assert.ok(bodies.length >= 1)
-    const messages = (bodies[0] as { messages: Array<{ role: string; content: string }> }).messages
-    const system = messages.find((message) => message.role === 'system')?.content ?? ''
-    // The AI must never call diary_*/chatlog_*/blob_*/workspace_* here just
-    // because the MEMORY.md seed mentions them.
-    assert.match(system, /只有 web_search/)
-    assert.match(system, /不在此会话提供/)
+    // The full heartbeat registry is sent, not just web_search — chat can both
+    // talk and act (blob/diary/chatlog/workspace/search).
+    const tools = (bodies[0] as { tools?: Array<{ function: { name: string } }> }).tools ?? []
+    const names = tools.map((tool) => tool.function.name)
+    assert.ok(names.includes('web_search'))
+    assert.ok(names.includes('blob_read'))
+    assert.ok(names.includes('blob_write'))
+    assert.ok(names.includes('workspace_list'))
+    assert.ok(names.includes('workspace_write'))
+    assert.ok(names.includes('diary_append'))
+    assert.ok(names.includes('diary_read'))
+    assert.ok(names.includes('chatlog_search'))
+    assert.ok(names.includes('chatlog_read'))
+    assert.ok(names.length >= 10)
   })
 
   test('rejects an empty message', async () => {
