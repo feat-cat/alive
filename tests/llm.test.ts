@@ -6,7 +6,7 @@
 import { afterEach, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mock } from 'node:test'
-import { buildChatBody, chatCompletion, degradeVisionMessages, isVisionUnsupportedError, streamChatCompletion, StreamToolCallsError, stripImageContent, withProviderMessageName, type LlmMessage } from '../agents/_llm.ts'
+import { buildChatBody, chatCompletion, degradeVisionMessages, isVisionUnsupportedError, streamChatCompletion, stripImageContent, withProviderMessageName, type LlmMessage, type LlmToolCall } from '../agents/_llm.ts'
 import { gatewayEnv, makeContext } from './_helpers.ts'
 
 afterEach(() => {
@@ -536,22 +536,148 @@ describe('streamChatCompletion (SSE)', () => {
     )
   })
 
-  test('throws StreamToolCallsError when a delta requests tool calls (stream aborts to fallback)', async () => {
+  test('calls onReasoning for reasoning_content deltas; content and reasoning accumulate independently', async () => {
+    const deltas: string[] = []
+    const reasoning: string[] = []
     mock.method(globalThis, 'fetch', async () =>
       sseStreamResponse([
-        sseData({ choices: [{ delta: { tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'echo', arguments: '{}' } }] } }] }),
+        sseData({ choices: [{ delta: { reasoning_content: '让我想' } }] }),
+        sseData({ choices: [{ delta: { reasoning_content: '想一下' } }] }),
+        sseData({ choices: [{ delta: { content: '答案' } }] }),
+        sseData({ choices: [{ delta: { reasoning_content: '（补充思考）' } }] }),
+        sseData({ choices: [{ delta: { content: '在此' } }] }),
         'data: [DONE]\n\n',
       ]))
 
-    await assert.rejects(
-      streamChatCompletion({
-        context,
-        conversationId: 'eo-test',
-        messages: [{ role: 'user', content: 'go' }],
-        onDelta: () => {},
-      }),
-      (error: unknown) => error instanceof StreamToolCallsError,
-    )
+    const result = await streamChatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: '你好' }],
+      onDelta: (delta) => deltas.push(delta),
+      onReasoning: (text) => reasoning.push(text),
+    })
+
+    assert.deepEqual(reasoning, ['让我想', '想一下', '（补充思考）'])
+    assert.deepEqual(deltas, ['答案', '在此'])
+    assert.equal(result.text, '答案在此')
+  })
+
+  test('does not call onReasoning when the stream carries no reasoning_content', async () => {
+    const reasoning: string[] = []
+    mock.method(globalThis, 'fetch', async () =>
+      sseStreamResponse([
+        sseData({ choices: [{ delta: { content: '好' } }] }),
+        'data: [DONE]\n\n',
+      ]))
+
+    await streamChatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'hi' }],
+      onDelta: () => {},
+      onReasoning: (text) => reasoning.push(text),
+    })
+
+    assert.deepEqual(reasoning, [])
+  })
+
+  test('accumulates tool_call arguments across deltas and calls onToolCalls once', async () => {
+    const calls: LlmToolCall[][] = []
+    const fullArgs = JSON.stringify({ path: 'a.txt', n: 2 })
+    // The gateway sends `arguments` as incremental chunks — slice the full JSON
+    // string into pieces so no literal with a closing brace trips the parser.
+    const part1 = fullArgs.slice(0, 10)
+    const part2 = fullArgs.slice(10, 16)
+    const part3 = fullArgs.slice(16)
+    mock.method(globalThis, 'fetch', async () =>
+      sseStreamResponse([
+        sseData({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'echo', arguments: part1 } }] } }] }),
+        sseData({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: part2 } }] } }] }),
+        sseData({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: part3 } }] } }] }),
+        'data: [DONE]\n\n',
+      ]))
+
+    const result = await streamChatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      onDelta: () => {},
+      onToolCalls: (toolCalls) => calls.push(toolCalls),
+    })
+
+    assert.equal(calls.length, 1)
+    assert.deepEqual(calls[0], [{ id: 'call_1', name: 'echo', arguments: fullArgs }])
+    assert.deepEqual(result.toolCalls, calls[0])
+    assert.equal(result.text, '')
+  })
+
+  test('accumulates multiple tool_call indices independently and sorts by index', async () => {
+    const calls: LlmToolCall[][] = []
+    const argsA = JSON.stringify({ a: 1 })
+    const argsB = JSON.stringify({ b: 2 })
+    mock.method(globalThis, 'fetch', async () =>
+      sseStreamResponse([
+        sseData({
+          choices: [{
+            delta: {
+              tool_calls: [
+                { index: 0, id: 'call_1', type: 'function', function: { name: 'echo', arguments: argsA.slice(0, 4) } },
+                { index: 1, id: 'call_2', type: 'function', function: { name: 'echo', arguments: argsB.slice(0, 4) } },
+              ],
+            },
+          }],
+        }),
+        sseData({
+          choices: [{
+            delta: {
+              tool_calls: [
+                { index: 1, function: { arguments: argsB.slice(4) } },
+                { index: 0, function: { arguments: argsA.slice(4) } },
+              ],
+            },
+          }],
+        }),
+        'data: [DONE]\n\n',
+      ]))
+
+    const result = await streamChatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      onDelta: () => {},
+      onToolCalls: (toolCalls) => calls.push(toolCalls),
+    })
+
+    assert.equal(calls.length, 1)
+    assert.deepEqual(calls[0], [
+      { id: 'call_1', name: 'echo', arguments: argsA },
+      { id: 'call_2', name: 'echo', arguments: argsB },
+    ])
+    assert.deepEqual(result.toolCalls, calls[0])
+  })
+
+  test('no tool_calls deltas means onToolCalls is never called and result.toolCalls is empty', async () => {
+    const calls: LlmToolCall[][] = []
+    mock.method(globalThis, 'fetch', async () =>
+      sseStreamResponse([
+        sseData({ choices: [{ delta: { content: '好' } }] }),
+        'data: [DONE]\n\n',
+      ]))
+
+    const result = await streamChatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'hi' }],
+      tools,
+      onDelta: () => {},
+      onToolCalls: (toolCalls) => calls.push(toolCalls),
+    })
+
+    assert.equal(calls.length, 0)
+    assert.deepEqual(result.toolCalls, [])
+    assert.equal(result.text, '好')
   })
 
   test('throws a descriptive error on a non-2xx response', async () => {
@@ -682,3 +808,4 @@ describe('vision degradation helpers', () => {
     assert.equal(degraded[2]?.content, '早前回复')
   })
 })
+

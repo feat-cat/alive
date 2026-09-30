@@ -347,7 +347,7 @@ function parseToolCalls(message: NonNullable<RawCompletion['choices']>[number]['
 }
 
 /** Parse model-provided args whether the gateway sent a JSON string or an object. */
-function safeParseArguments(raw: string | Record<string, unknown>): Record<string, unknown> {
+export function safeParseArguments(raw: string | Record<string, unknown>): Record<string, unknown> {
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw
   if (typeof raw !== 'string' || !raw.trim()) return {}
   try {
@@ -497,11 +497,10 @@ function textOf(message: { content?: LlmContent } | undefined): string {
 }
 
 /**
- * The streaming path is TEXT-ONLY: when the model decides to call tools it
- * signals `StreamToolCallsError` and the endpoint aborts the stream and falls
- * back to the non-streaming `chatCompletion` on a fresh request. This keeps the
- * stream loop simple and the tool-execution semantics (bounded turns, tool
- * results re-injected) in exactly one place.
+ * @deprecated Legacy signal used when the streaming path aborted on tool calls
+ * and fell back to a non-streaming completion. Chat now streams the full
+ * tool-loop (tool_call/tool_result events + continued streaming), so this class
+ * is kept only for backward-compat imports and is no longer thrown.
  */
 export class StreamToolCallsError extends Error {
   name = 'StreamToolCallsError'
@@ -515,9 +514,11 @@ export interface StreamChatCompletionOptions {
   conversationId: string
   messages: LlmMessage[]
   /**
-   * Tool definitions are SENT so the model may still choose to act; a delta
-   * that carries `tool_calls` aborts the stream by throwing
-   * `StreamToolCallsError` instead of buffering partial text.
+   * Tool definitions are SENT so the model may still choose to act. Unlike the
+   * legacy behaviour (abort + non-streaming fallback), `tool_calls` deltas are
+   * accumulated across chunks and delivered to `onToolCalls` exactly once when
+   * the stream ends with model-requested tool calls. The host is responsible
+   * for executing the tools and starting the next streaming round.
    */
   tools?: LlmToolDef[]
   signal?: AbortSignal
@@ -525,40 +526,120 @@ export interface StreamChatCompletionOptions {
   maxTokens?: number
   /** Called with each decoded content delta exactly once, in order. */
   onDelta: (text: string) => void
+  /**
+   * Called with each decoded `reasoning_content` delta (DeepSeek thinking) exactly
+   * once, in order. Optional: callers that don't render thinking can omit it.
+   */
+  onReasoning?: (reasoning: string) => void
+  /**
+   * Called exactly once when the stream ends with model-requested tool calls:
+   * the incremental `tool_calls` deltas are re-assembled per index into
+   * complete `LlmToolCall[]` entries. Not called when the model replies
+   * without tools.
+   */
+  onToolCalls?: (toolCalls: LlmToolCall[]) => void
 }
 
 export interface StreamChatResult {
   text: string
+  /** Complete tool calls requested by the model (empty when the reply is text-only). */
+  toolCalls: LlmToolCall[]
+}
+
+/** One decoded tool_call delta from a stream chunk (arguments are partial). */
+interface StreamToolCallDelta {
+  index?: number
+  id?: string
+  name?: string
+  arguments?: string
 }
 
 /** One decoded SSE chunk from the gateway stream. */
 interface StreamDelta {
   content: string | null
-  toolCalls: boolean
+  reasoning: string | null
+  toolCallDeltas: StreamToolCallDelta[]
 }
 
-/** Extract the content delta + whether any tool_call was requested from one chunk. */
+/**
+ * Extract the content delta, the reasoning_content delta and any tool_call
+ * deltas from one chunk. `content` and `reasoning_content` are both
+ * OpenAI-standard string deltas (DeepSeek V4 streams thinking ahead of the
+ * final answer in `delta.reasoning_content`); they are accumulated and
+ * delivered independently. `delta.tool_calls` entries are per-index deltas —
+ * `arguments` arrives as an incremental string across multiple chunks and is
+ * stitched together by the stream loop.
+ */
 function extractStreamDelta(parsed: unknown): StreamDelta {
-  if (!parsed || typeof parsed !== 'object') return { content: null, toolCalls: false }
-  const chunk = parsed as { choices?: Array<{ delta?: { content?: unknown; tool_calls?: unknown } }> }
+  if (!parsed || typeof parsed !== 'object') return { content: null, reasoning: null, toolCallDeltas: [] }
+  const chunk = parsed as {
+    choices?: Array<{ delta?: { content?: unknown; reasoning_content?: unknown; tool_calls?: unknown } }>
+  }
   const delta = chunk.choices?.[0]?.delta
-  if (!delta) return { content: null, toolCalls: false }
+  if (!delta) return { content: null, reasoning: null, toolCallDeltas: [] }
   const content = typeof delta.content === 'string' && delta.content.length > 0 ? delta.content : null
-  const toolCalls = Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0
-  return { content, toolCalls }
+  const reasoning =
+    typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0
+      ? delta.reasoning_content
+      : null
+  const toolCallDeltas: StreamToolCallDelta[] = []
+  if (Array.isArray(delta.tool_calls)) {
+    for (const raw of delta.tool_calls) {
+      if (!raw || typeof raw !== 'object') continue
+      const call = raw as {
+        index?: unknown
+        id?: unknown
+        function?: { name?: unknown; arguments?: unknown }
+      }
+      const index = typeof call.index === 'number' ? call.index : undefined
+      const id = typeof call.id === 'string' && call.id ? call.id : undefined
+      const name = typeof call.function?.name === 'string' && call.function.name ? call.function.name : undefined
+      let args: string | undefined
+      const rawArgs = call.function?.arguments
+      if (typeof rawArgs === 'string') {
+        args = rawArgs
+      } else if (rawArgs !== undefined && rawArgs !== null && typeof rawArgs === 'object') {
+        // Some gateways send the complete arguments as an object on the first
+        // delta; stringify once so the accumulator never mixes shapes.
+        args = JSON.stringify(rawArgs)
+      }
+      toolCallDeltas.push({ index, id, name, arguments: args })
+    }
+  }
+  return { content, reasoning, toolCallDeltas }
+}
+
+/**
+ * Re-assemble per-index tool_call deltas into complete `LlmToolCall[]` entries
+ * sorted by their stream index. Each delta may carry the id/name once (first
+ * chunk) and a partial `arguments` string that is appended across chunks.
+ */
+function buildAccumulatedToolCalls(
+  accumulator: Map<number, { id: string; name: string; arguments: string }>,
+): LlmToolCall[] {
+  return [...accumulator.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, call]) => ({ ...call }))
+    .filter((call) => call.name.trim().length > 0)
+    .map((call, index) => ({ id: call.id || `call_${index + 1}`, name: call.name, arguments: call.arguments }))
 }
 
 /**
  * Stream a single chat-completion request from the Makers AI Gateway
  * (`stream: true`). Parses SSE `data:` frames from the response body, feeds
- * each `choices[0].delta.content` to `onDelta`, and accumulates the full text
- * in `{ text }`. Frames are split across arbitrary byte boundaries, `[DONE]`
- * (or end-of-stream) terminates the read, non-2xx responses throw with the
- * status + body snippet, and the caller's `signal` / the LLM timeout abort the
- * request like the blocking path.
+ * each `choices[0].delta.content` to `onDelta` and each
+ * `choices[0].delta.reasoning_content` (DeepSeek thinking) to `onReasoning`,
+ * accumulates the full text in `{ text }`, and — when the model requests tool
+ * calls — stitches the incremental `tool_calls` deltas into complete entries,
+ * delivers them once to `onToolCalls`, and returns them in `{ toolCalls }`.
+ * Reasoning is callback-only (never persisted/accumulated into the result).
+ * Frames are split across arbitrary byte boundaries, `[DONE]` (or
+ * end-of-stream) terminates the read, non-2xx responses throw with the status
+ * + body snippet, and the caller's `signal` / the LLM timeout abort the request
+ * like the blocking path.
  */
 export async function streamChatCompletion(options: StreamChatCompletionOptions): Promise<StreamChatResult> {
-  const { context, conversationId, messages, tools, signal, temperature = 0.6, maxTokens, onDelta } = options
+  const { context, conversationId, messages, tools, signal, temperature = 0.6, maxTokens, onDelta, onReasoning, onToolCalls } = options
   const gateway = requireGatewayEnv(context)
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS)
@@ -585,6 +666,7 @@ export async function streamChatCompletion(options: StreamChatCompletionOptions)
     const decoder = new TextDecoder()
     let buffer = ''
     let text = ''
+    const toolCallAccumulator = new Map<number, { id: string; name: string; arguments: string }>()
 
     outer: while (true) {
       if (controller.signal.aborted) throwAbort()
@@ -606,16 +688,25 @@ export async function streamChatCompletion(options: StreamChatCompletionOptions)
           continue
         }
         const delta = extractStreamDelta(parsed)
-        if (delta.toolCalls) throw new StreamToolCallsError()
+        for (const toolCallDelta of delta.toolCallDeltas) {
+          const index = toolCallDelta.index ?? 0
+          const current = toolCallAccumulator.get(index) ?? { id: '', name: '', arguments: '' }
+          if (toolCallDelta.id) current.id = current.id || toolCallDelta.id
+          if (toolCallDelta.name) current.name = toolCallDelta.name
+          if (toolCallDelta.arguments) current.arguments += toolCallDelta.arguments
+          toolCallAccumulator.set(index, current)
+        }
+        if (delta.reasoning && onReasoning) onReasoning(delta.reasoning)
         if (delta.content) {
           text += delta.content
           onDelta(delta.content)
         }
       }
     }
-    return { text }
+    const toolCalls = buildAccumulatedToolCalls(toolCallAccumulator)
+    if (toolCalls.length > 0 && onToolCalls) onToolCalls(toolCalls)
+    return { text, toolCalls }
   } catch (error) {
-    if (error instanceof StreamToolCallsError) throw error
     if (controller.signal.aborted) {
       const abort = new Error('LLM request aborted')
       abort.name = 'AbortError'

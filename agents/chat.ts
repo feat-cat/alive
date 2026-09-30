@@ -3,10 +3,16 @@
  *
  * Flow (streaming, the default): append user message → build a persona (wall
  * clock + MEMORY.md "self") → feed the model a STANDARD messages array
- * ([system(persona), ...history] from the store via `loadMessages`) → try
- * `streamChatCompletion` (AI Gateway `stream: true`). Every text delta is
- * emitted as an SSE `ai_response` event while the full text accumulates; after
- * the stream closes the assistant reply is persisted (store + chatlog archive).
+ * ([system(persona), ...history] from the store via `loadMessages`) → run a
+ * bounded loop of `streamChatCompletion` rounds (AI Gateway `stream: true`).
+ * Every text delta is emitted as an SSE `ai_response` event while the full text
+ * accumulates; each `reasoning_content` delta (DeepSeek thinking) is emitted as
+ * a separate `reasoning_delta` event for the client to fold/show. When the
+ * model requests tool calls, the stream does NOT degrade: the accumulated
+ * `tool_call` / `tool_result` progress is emitted as SSE events, the results
+ * are appended to the message array, and the next `streamChatCompletion` round
+ * continues streaming the final answer (`streamed:true` throughout). After the
+ * last round the assistant reply is persisted (store + chatlog archive).
  *
  * Images: the request body may carry `images: string[]` (base64 `data:` URLs).
  * They are assembled into an OpenAI multimodal content array
@@ -20,14 +26,11 @@
  * prompt gains `VISION_UNSUPPORTED_NOTE` and every content array is stripped
  * back to text. A non-image 400 is thrown as-is.
  *
- * Tool fallback: chat keeps the FULL tool registry (blob + diary + chatlog +
+ * Tool streaming: chat keeps the FULL tool registry (blob + diary + chatlog +
  * workspace + search, same as heartbeat) so the agent can still act while
- * chatting — the tool definitions are sent on the streaming call too. If the
- * model chooses to call a tool, the first tool_call delta aborts the stream via
- * `StreamToolCallsError`, and the endpoint falls back to the non-streaming
- * `chatCompletion` loop which executes the tools; the completed reply is then
- * sent as ONE `ai_response` SSE event (`streamed:false`) before `[DONE]`, so
- * the transport stays consistently SSE for streaming clients.
+ * chatting. Tool execution never crashes the turn: a throwing tool becomes
+ * `{ isError: true }` (rule #11), its content is clamped for the model budget,
+ * and the loop is bounded by `CHAT_MAX_TURNS`.
  *
  * JSON compat: `?stream=false` (query) or `{ "stream": false }` (body) returns
  * the original one-shot JSON envelope via `runChat`.
@@ -35,6 +38,7 @@
 import {
   SELF_ID,
   asMakersContext,
+  clampText,
   createSSEResponse,
   errorResponse,
   jsonOk,
@@ -46,14 +50,16 @@ import {
   type MakersContext,
 } from './_shared.ts'
 import {
-  StreamToolCallsError,
   chatCompletion,
   degradeVisionMessages,
   isVisionUnsupportedError,
+  safeParseArguments,
   streamChatCompletion,
   type LlmContent,
   type LlmContentPart,
   type LlmMessage,
+  type LlmToolCall,
+  type ToolRunRecord,
 } from './_llm.ts'
 import { buildPersona, humanNowText } from './_persona.ts'
 import {
@@ -70,6 +76,10 @@ import { buildTools } from './_tools.ts'
 const CHAT_MAX_TURNS = 3
 const CHAT_TEMPERATURE = 0.7
 const CHAT_MAX_TOKENS = 600
+/** Tool-result characters sent back to the model (same budget as `_llm`'s clamp). */
+const MODEL_TOOL_RESULT_MAX = 4_000
+/** Tool-result characters surfaced in the `tool_result` SSE event (frontend fold). */
+const CLIENT_TOOL_RESULT_MAX = 600
 /** How many LLM attempts per turn: 1 normal + 1 vision-degraded retry max. */
 const MAX_VISION_ATTEMPTS = 2
 /** Max images accepted per chat turn (server-side cap, same as the frontend). */
@@ -168,18 +178,22 @@ async function chatCompletionWithVisionFallback(
 }
 
 /**
- * Producer/consumer bridge between `streamChatCompletion`'s `onDelta` callback
- * (a plain function — it cannot `yield`) and the async-generator of SSE
- * frames. `push` never blocks the producer; `next` resolves as soon as a delta
- * is available or the producer closes.
+ * Producer/consumer bridge between `streamChatCompletion`'s `onDelta` /
+ * `onReasoning` callbacks (plain functions — they cannot `yield`) and the
+ * async-generator of SSE frames. `push` never blocks the producer; `next`
+ * resolves as soon as a frame is available or the producer closes. Each frame
+ * is tagged so the drain loop can distinguish final `ai_response` text from
+ * `reasoning_delta` (thinking) frames without losing their relative order.
  */
+type StreamFrame = { kind: 'content'; text: string } | { kind: 'reasoning'; text: string }
+
 class DeltaBuffer {
-  private queue: string[] = []
+  private queue: StreamFrame[] = []
   private resolver: (() => void) | null = null
   private closed = false
 
-  push(text: string): void {
-    this.queue.push(text)
+  push(frame: StreamFrame): void {
+    this.queue.push(frame)
     this.signal()
   }
 
@@ -196,23 +210,26 @@ class DeltaBuffer {
     }
   }
 
-  async next(): Promise<{ done: boolean; value?: string }> {
+  async next(): Promise<{ done: true } | { done: false; value: StreamFrame }> {
     while (this.queue.length === 0) {
       if (this.closed) return { done: true }
       await new Promise<void>((resolve) => {
         this.resolver = resolve
       })
     }
-    return { done: false, value: this.queue.shift() }
+    const value = this.queue.shift()
+    if (value === undefined) return { done: true }
+    return { done: false, value }
   }
 }
 
 /**
  * Async-generator of SSE frames for the streaming path. Shared setup with the
- * blocking `runChat`, then either live text deltas (`streamed:true`) or —
- * after a `StreamToolCallsError` — one complete reply (`streamed:false`)
- * produced by the non-streaming tool loop. The full assistant reply is ALWAYS
- * persisted so history stays complete regardless of which branch ran.
+ * blocking `runChat`, then the multi-round `streamChatTurn` loop: live text
+ * deltas (`streamed:true`), `reasoning_delta` thinking, and — when the model
+ * acts — `tool_call` / `tool_result` progress events with the answer continuing
+ * to stream. The full assistant reply is ALWAYS persisted so history stays
+ * complete regardless of whether tools ran.
  *
  * Vision degradation applies here too: when the gateway rejects the image
  * request, the whole turn is retried once with images stripped and the system
@@ -255,7 +272,81 @@ async function* chatStreamGenerator(
   }
 }
 
-/** One full attempt of the streaming turn: live deltas or the tool-loop reply + persistence. */
+/** Abort error helper for tool-loop checkpoints (silenced by the SSE transport). */
+function abortError(): Error {
+  const abort = new Error('Aborted')
+  abort.name = 'AbortError'
+  return abort
+}
+
+/**
+ * Drive ONE streaming LLM round: buffer `onDelta`/`onReasoning` frames into SSE
+ * events as they decode (typewriter), and collect any model-requested tool
+ * calls from the accumulated `tool_calls` deltas. The gateway stream runs in a
+ * side task because callbacks cannot `yield`; the returned generator drains the
+ * buffer while the stream is still producing. Returns the accumulated text and
+ * the complete tool calls via `yield*`'s return value; throws the stream error
+ * (if any) after draining so `createSSEResponse` maps it to `error_message`.
+ */
+async function* streamOneTurn(
+  context: MakersContext,
+  conversationId: string,
+  messages: LlmMessage[],
+  tools: ReturnType<typeof buildTools>,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<string, { fullText: string; toolCalls: LlmToolCall[] }> {
+  const buffer = new DeltaBuffer()
+  let streamError: unknown = null
+  let toolCalls: LlmToolCall[] = []
+  const streamTask = (async () => {
+    try {
+      await streamChatCompletion({
+        context,
+        conversationId,
+        messages,
+        tools: tools.definitions,
+        signal,
+        temperature: CHAT_TEMPERATURE,
+        maxTokens: CHAT_MAX_TOKENS,
+        onDelta: (delta) => buffer.push({ kind: 'content', text: delta }),
+        onReasoning: (reasoning) => buffer.push({ kind: 'reasoning', text: reasoning }),
+        onToolCalls: (calls) => {
+          toolCalls = calls
+        },
+      })
+    } catch (error) {
+      streamError = error
+    } finally {
+      buffer.close()
+    }
+  })()
+
+  let fullText = ''
+  for (;;) {
+    const frame = await buffer.next()
+    if (frame.done) break
+    if (frame.value.kind === 'reasoning') {
+      // DeepSeek thinking: a separate event the frontend can fold/show above
+      // the answer bubble. Reasoning is never persisted.
+      yield sseEvent({ type: 'reasoning_delta', content: frame.value.text })
+    } else {
+      fullText += frame.value.text
+      yield sseEvent({ type: 'ai_response', content: frame.value.text, streamed: true })
+    }
+  }
+  await streamTask
+  if (streamError) throw streamError
+  return { fullText, toolCalls }
+}
+
+/**
+ * Full streaming turn: a bounded loop of `streamOneTurn` rounds. When a round
+ * ends with model-requested tool calls, the tools are executed (each emitting a
+ * `tool_call` progress event then a clamped `tool_result` event), the assistant
+ * tool_calls message + `role:'tool'` results are appended, and the next round
+ * streams again — so the reply stays `streamed:true` the whole way. The full
+ * assistant reply and every tool record are persisted before `[DONE]`.
+ */
 async function* streamChatTurn(
   context: MakersContext,
   conversationId: string,
@@ -263,65 +354,49 @@ async function* streamChatTurn(
   tools: ReturnType<typeof buildTools>,
   signal: AbortSignal | undefined,
 ): AsyncGenerator<string> {
-  let fullText = ''
-  try {
-    // Drive the gateway stream from a side task and drain deltas into SSE
-    // frames as they arrive (no `yield` allowed inside `onDelta`, hence the
-    // buffer bridge). Stream errors are captured and rethrown out of the
-    // generator so `createSSEResponse` maps them to an `error_message` frame.
-    const buffer = new DeltaBuffer()
-    let streamError: unknown = null
-    const streamTask = (async () => {
-      try {
-        await streamChatCompletion({
-          context,
-          conversationId,
-          messages,
-          tools: tools.definitions,
-          signal,
-          temperature: CHAT_TEMPERATURE,
-          maxTokens: CHAT_MAX_TOKENS,
-          onDelta: (delta) => buffer.push(delta),
-        })
-      } catch (error) {
-        streamError = error
-      } finally {
-        buffer.close()
-      }
-    })()
+  let current = messages
+  const toolResults: ToolRunRecord[] = []
+  let reply = '（没有回复）'
 
-    for (;;) {
-      const { done, value } = await buffer.next()
-      if (done) break
-      fullText += value
-      yield sseEvent({ type: 'ai_response', content: value, streamed: true })
+  for (let turn = 1; turn <= CHAT_MAX_TURNS; turn += 1) {
+    if (signal?.aborted) throw abortError()
+    const { fullText, toolCalls } = yield* streamOneTurn(context, conversationId, current, tools, signal)
+
+    // No tool work left: this round produced the final answer.
+    if (toolCalls.length === 0) {
+      reply = fullText.trim() || '（没有回复）'
+      break
     }
-    await streamTask
-    if (streamError) throw streamError
-  } catch (error) {
-    if (!(error instanceof StreamToolCallsError)) throw error
-    // The model wants to ACT: abort the stream and run the full bounded tool
-    // loop non-streaming, then deliver the final reply in one event.
-    const result = await chatCompletion({
-      context,
-      conversationId,
-      messages,
-      tools: tools.definitions,
-      toolRunner: tools.run,
-      maxTurns: CHAT_MAX_TURNS,
-      signal,
-      temperature: CHAT_TEMPERATURE,
-      maxTokens: CHAT_MAX_TOKENS,
-    })
-    await recordToolCalls(context, conversationId, result.toolResults)
-    const reply = result.text.trim() || '（没有回复）'
-    await persistHistory(context, conversationId, 'assistant', reply)
-    yield sseEvent({ type: 'ai_response', content: reply, streamed: false })
-    yield sseDone()
-    return
+
+    // The model wants to ACT. Record the tool_calls on the assistant message,
+    // execute each call (never crashing the turn — a throwing tool becomes an
+    // `isError` result), emit progress events, and feed the results back.
+    current = [...current, { role: 'assistant', content: fullText, tool_calls: toolCalls }]
+    for (const call of toolCalls) {
+      if (signal?.aborted) throw abortError()
+      const args = safeParseArguments(call.arguments)
+      yield sseEvent({ type: 'tool_call', name: call.name, arguments: args })
+      const result = await tools.run(call.name, args, signal).catch((error: unknown) => ({
+        content: error instanceof Error ? `Tool error: ${error.message}` : `Tool error: ${String(error)}`,
+        isError: true,
+      }))
+      const modelText = clampText(result.content, MODEL_TOOL_RESULT_MAX)
+      toolResults.push({
+        name: call.name,
+        args,
+        isError: result.isError === true,
+        content: modelText,
+      })
+      yield sseEvent({ type: 'tool_result', name: call.name, content: clampText(result.content, CLIENT_TOOL_RESULT_MAX) })
+      current = [...current, { role: 'tool', tool_call_id: call.id, name: call.name, content: modelText }]
+    }
+
+    // The turn budget was spent on this tool batch: persist what we have.
+    if (turn >= CHAT_MAX_TURNS) break
   }
 
-  const reply = fullText.trim() || '（没有回复）'
+  // Tool records go into history BEFORE the final assistant reply.
+  await recordToolCalls(context, conversationId, toolResults)
   await persistHistory(context, conversationId, 'assistant', reply)
   yield sseDone()
 }

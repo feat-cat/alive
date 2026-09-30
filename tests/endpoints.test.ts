@@ -186,47 +186,106 @@ describe('POST /chat', () => {
     assert.ok(bodyText.includes('"content":"你"'))
     assert.ok(bodyText.includes('"content":"好"'))
     assert.ok(bodyText.includes('"content":"呀"'))
+    // A pure content stream must not fabricate reasoning_delta events.
+    assert.ok(!bodyText.includes('"type":"reasoning_delta"'))
     // The client saw per-token deltas; history stored the accumulated reply.
     assert.equal(store.messageLog.at(-1)?.role, 'assistant')
     assert.equal(store.messageLog.at(-1)?.content, '你好呀')
   })
 
-  test('tool branch: aborts the stream and sends the non-streaming tool-loop reply as one SSE event', async () => {
+  test('streaming path: reasoning deltas arrive as reasoning_delta SSE events; only the content persists', async () => {
     const store = makeMockStore()
+    const encoder = new TextEncoder()
+    const payloads = [
+      { choices: [{ delta: { reasoning_content: '先' } }] },
+      { choices: [{ delta: { reasoning_content: '思考' } }] },
+      { choices: [{ delta: { content: '你好' } }] },
+    ]
+    mock.method(globalThis, 'fetch', async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const payload of payloads) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`))
+          }
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+        },
+      })
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+
+    const res = await chatOnRequest(makeContext({ store, env: gatewayEnv() as Env, body: { message: '你好' } }))
+    assert.equal(res.status, 200)
+    assert.match(res.headers.get('content-type') ?? '', /^text\/event-stream/)
+    const bodyText = await res.text()
+    assert.ok(bodyText.includes('"type":"reasoning_delta"'))
+    assert.ok(bodyText.includes('"content":"先"'))
+    assert.ok(bodyText.includes('"content":"思考"'))
+    assert.ok(bodyText.includes('"type":"ai_response"'))
+    assert.ok(bodyText.includes('data: [DONE]'))
+    // Reasoning is streamed but never persisted — history holds the content only.
+    assert.equal(store.messageLog.at(-1)?.role, 'assistant')
+    assert.equal(store.messageLog.at(-1)?.content, '你好')
+  })
+
+  test('tool branch: tool_call/tool_result events stream in and the answer continues ai_response streamed:true', async () => {
+    const store = makeMockStore()
+    const encoder = new TextEncoder()
+    // The gateway sends `arguments` as incremental chunks; slice the full JSON
+    // string so no fragile literal with a closing brace trips the parser.
+    const webArgs = JSON.stringify({ query: 'x' })
+    const webPart1 = webArgs.slice(0, 10)
+    const webPart2 = webArgs.slice(10)
     let fetchCalls = 0
     mock.method(globalThis, 'fetch', async () => {
       fetchCalls += 1
       if (fetchCalls === 1) {
-        const encoder = new TextEncoder()
-        const delta = {
-          choices: [{
-            delta: {
-              tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'web_search', arguments: '{"query":"x"}' } }],
-            },
-          }],
-        }
+        // Round 1: the model streams tool_calls deltas (arguments split across
+        // chunks like a real gateway) then ends the stream.
         const body = new ReadableStream<Uint8Array>({
           start(controller) {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(delta)}\n\n`))
+            const tool1 = { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'web_search', arguments: webPart1 } }] } }] }
+            const tool2 = { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: webPart2 } }] } }] }
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(tool1)}\n\n`))
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(tool2)}\n\n`))
             controller.enqueue(encoder.encode('data: [DONE]\n\n'))
             controller.close()
           },
         })
         return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
       }
-      // Non-streaming fallback answers with plain text (tools already consumed).
-      return new Response(JSON.stringify({ choices: [{ message: { content: '我查完了，答案是 11。' } }] }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
+      // Round 2: the continuation turn streams the final answer — still
+      // typewriter (`streamed:true`), NOT a one-shot degraded reply.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: '我查完' } }] })}\n\n`))
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: '了，答案是 11。' } }] })}\n\n`))
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+        },
       })
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
     })
 
     const res = await chatOnRequest(makeContext({ store, env: gatewayEnv() as Env, body: { message: '帮我查一下' } }))
     assert.equal(res.status, 200)
     const bodyText = await res.text()
+    // Two streaming rounds happened, each with ai_response deltas.
+    assert.ok(bodyText.includes('"type":"ai_response"'))
+    assert.ok(bodyText.includes('"streamed":true'))
+    assert.ok(bodyText.includes('"content":"我查完"'))
+    assert.ok(bodyText.includes('"content":"了，答案是 11。'))
+    // Tool progress is inserted as its own events between the streaming rounds.
+    assert.ok(bodyText.includes('"type":"tool_call"'))
+    assert.ok(bodyText.includes('"type":"tool_result"'))
+    assert.ok(bodyText.includes('"name":"web_search"'))
     assert.ok(bodyText.includes('data: [DONE]'))
-    assert.ok(bodyText.includes('我查完了，答案是 11。'))
     assert.equal(fetchCalls, 2)
+    // The tool record is persisted BEFORE the final assistant reply; history
+    // stores the accumulated full answer.
+    const toolRows = store.messageLog.filter((row) => row.role === 'assistant' && row.metadata?.kind === 'tool')
+    assert.equal(toolRows.length, 1)
+    assert.match(toolRows[0]?.content ?? '', /web_search/)
     assert.equal(store.messageLog.at(-1)?.role, 'assistant')
     assert.equal(store.messageLog.at(-1)?.content, '我查完了，答案是 11。')
   })

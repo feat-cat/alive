@@ -164,17 +164,29 @@ default — the reply appears token-by-token instead of as one JSON blob:
 - **`ai_response`** — each text delta from the model is sent as one event:
   `{ "type": "ai_response", "content": "<delta>", "streamed": true }` (repeat for
   every token, giving the typing effect).
-- **Tool degradation** — chat carries the **full tool registry** on the streaming
-  call too, so the agent can still act. If the model decides to call a tool the
-  stream is aborted and the agent falls back to the non-streaming tool loop; the
-  final answer is then delivered as **one** `ai_response` event with
-  `"streamed": false`.
+- **`reasoning_delta`** — when the model streams `reasoning_content` (DeepSeek
+  thinking), each thinking delta is sent as a separate event:
+  `{ "type": "reasoning_delta", "content": "<delta>" }`, always before the final
+  answer. The bundled web frontend (`web/index.html`) folds them into a
+  collapsible "💭 思考过程" block above the answer bubble (same typewriter
+  effect). Reasoning is **streamed but never persisted** to history.
+- **`tool_call` / `tool_result` (全程打字机)** — chat carries the **full tool
+  registry** on the streaming call, and tool execution is **fully streaming**:
+  when the model requests tools, the accumulated `tool_call` deltas are
+  delivered as `{ "type": "tool_call", "name": "<name>", "arguments": <parsed
+  args> }` (tool start) and `{ "type": "tool_result", "name": "<name>",
+  "content": "<clamped result>" }` (tool result). The result is appended to the
+  message array and the next `streamChatCompletion` round streams again — the
+  final answer is a normal `ai_response` with `"streamed": true`. The whole
+  turn stays typewriter, never degrading to a one-shot reply. The loop is
+  bounded by `CHAT_MAX_TURNS`, and a throwing tool becomes an `isError` result
+  (rule #11) instead of crashing the stream.
 - **`error_message`** — a mid-stream failure (e.g. gateway 5xx) arrives as
   `{ "type": "error_message", "content": "<message>" }` inside the stream.
 - The stream always ends with a `data: [DONE]` sentinel (plus a ~5s `ping` frame
   keeps idle connections/proxies alive).
-- The **accumulated full reply is always persisted** to history + chatlog,
-  whichever branch ran.
+- The **accumulated full reply is always persisted** to history + chatlog, and
+  every executed tool is recorded as a `kind:'tool'` history entry.
 
 Clients that still want the old one-shot JSON can opt out explicitly with
 `?stream=false` (query) or `{ "stream": false }` (body); the response is then the
@@ -286,12 +298,19 @@ Tests are fully mocked (in-memory store/sandbox/Blob, `globalThis.fetch` mocked 
 - **CORS headers are added, the web frontend can call the endpoints cross-origin:** every `jsonOk`/`jsonError` response carries `access-control-allow-origin: *` plus the common preflight headers (`access-control-allow-methods: GET,POST,OPTIONS`, `access-control-allow-headers: content-type,authorization`). This covers `/chat`, `/history`, `/stop` and `/heartbeat`. An `OPTIONS` preflight is still handled by the platform/edge layer — the JSON handlers themselves do not special-case it.
 - **apply_patch fuzzy match takes the first hit:** `seekSequence` replaces the first matching location (determinism over guessing intent).
 - **No web UI:** HTTP endpoints only.
-- **Local node proxy still buffers /chat as JSON (next step):** `/chat` now streams SSE, but `web/server.mjs` currently reads the upstream body fully and forwards it as JSON. The proxy still works (the JSON envelope is produced for `?stream=false`; the SSE body is passed through verbatim), but the real typewriter effect through the local proxy needs the SSE passthrough (`pipeline(upstream.body, res)` + `text/event-stream` content-type) — planned as the immediate next step. Browsers should connect to the cloud `/chat` directly (CORS is applied to the SSE response) until then.
+- **Local node proxy passes SSE through:** `web/server.mjs`'s `/api/chat` pipes the upstream SSE response stream straight to the browser (`text/event-stream`, so the typewriter effect works through the local proxy); `?stream=false` / `{ "stream": false }` still uses the one-shot JSON forwarding. Tool-stage `tool_call` / `tool_result` events flow through the stream too.
 - **Matrix integration reserved:** `chat.ts` + `stop.ts` provide conversation & abort, but no IM protocol is wired yet.
 - **edgeone.json framework/outputDirectory (P2-8):** Makers platform config pending deployment confirmation.
 - **No long-term distillation strategy:** `MEMORY.md` is written freely by the AI (no forced full-LLM distillation); history is injected per request as a standard messages array, bounded by auto-compact folding the oldest 20% (plus the gateway's own context handling). The full original history is never lost, though — every message is archived append-only to `chatlog/` and reachable via `GET /history` + the `chatlog_*` tools. Periodic diary-to-notes summarization can be added later.
 - **Diary append can lose one entry under extreme concurrency (P1-3):** `appendDailyLog` is a non-atomic read-modify-write; if the same calendar day is appended to concurrently (the public `/heartbeat` can be POSTed in parallel) the last writer wins and one entry may be dropped. Safe under the single-writer heartbeat semantics; a future Blob-append primitive would close the gap.
 - **Unified calendar validation:** all diary/chatlog read + write paths validate `YYYY-MM-DD` with the `dateFromDay` round-trip, so impossible dates like `2026-02-31` are rejected everywhere (reads return `null` / an error instead of silently probing a wrong blob key).
+- **Reasoning only streams on the streaming path:** the chat streaming path
+  emits `reasoning_delta` events (DeepSeek thinking) live, but the non-streaming
+  `chatCompletion` path (heartbeat/compact) does not parse `reasoning_content`
+  at all. Since chat tool turns now STREAM the full loop (`streamed:true`
+  throughout, `tool_call`/`tool_result` events), every chat turn shows thinking
+  — this limitation now only applies to heartbeat/compact and the JSON
+  (`stream:false`) chat path.
 
 ## License
 

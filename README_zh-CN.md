@@ -156,10 +156,14 @@ curl https://<你的部署域名>/history?days=30 -H 'authorization: Bearer <tok
 
 - **`ai_response`**——模型的每个文本增量是一条事件：
   `{ "type": "ai_response", "content": "<增量>", "streamed": true }`（逐 token 重复，形成打字机效果）。
-- **工具场景退化**——流式调用同样携带**完整工具集**，agent 聊天时仍能动手。若模型决定调用工具，流式立即中止并退化为非流式工具循环；最终回复以**一条** `ai_response` 事件发出（`"streamed": false`）。
+- **`reasoning_delta`**——当模型流式输出 `reasoning_content`（DeepSeek 思考过程）时，每段思考增量单独发一条事件：
+  `{ "type": "reasoning_delta", "content": "<增量>" }`，且总是出现在最终正文之前。随附的 web 前端（`web/index.html`）会把这些增量折叠成回复气泡上方的可折叠「💭 思考过程」区块（同样有打字机效果）。思考过程**只流式展示、不落库**。
+- **`tool_call` / `tool_result`（全程打字机）**——流式调用同样携带**完整工具集**，工具执行全程保持流式：模型请求工具时，累积的 tool_calls delta 会被还原成
+  `{ "type": "tool_call", "name": "<工具名>", "arguments": <解析后的参数> }`（工具开始事件）与
+  `{ "type": "tool_result", "name": "<工具名>", "content": "<截断后的结果>" }`（工具结果事件）。结果会追加回消息数组，紧接着的下一轮 `streamChatCompletion` 继续流式输出正文——最终回复依旧是 `"streamed": true` 的 `ai_response`，**不再退化为一次性回复**。整个回合都被 `CHAT_MAX_TURNS` 约束；工具抛错也只会变成 `isError` 结果（规则 #11），不会中断流。
 - **`error_message`**——流中途失败（如网关 5xx）以 `{ "type": "error_message", "content": "<消息>" }` 事件送达。
 - 流总是以 `data: [DONE]` 结束（另有约 5s 一次的 `ping` 帧保持长连接/代理存活）。
-- **无论哪个分支，累积的完整回复都会落盘**到 store 历史 + chatlog 归档。
+- **无论是否调用工具，累积的完整回复都会落盘**到 store 历史 + chatlog 归档，每次实际执行过的工具也会以 `kind:'tool'` 历史条目记录。
 
 仍想要旧的一次性 JSON 的客户端可显式 `?stream=false`（query）或 `{ "stream": false }`（body），返回原来的 `{ ok, reply, conversationId, now }` 封装。
 
@@ -263,12 +267,13 @@ npm test            # node --test tests/*.test.ts（node:test，无需额外框�
 - **CORS 头已加，web 前端可跨域调用**：所有 `jsonOk`/`jsonError` 响应都带 `access-control-allow-origin: *` 及常见 preflight 头（`access-control-allow-methods: GET,POST,OPTIONS`、`access-control-allow-headers: content-type,authorization`），覆盖 `/chat`、`/history`、`/stop`、`/heartbeat`。`OPTIONS` preflight 由平台/边缘层处理——JSON 处理器本身不做特殊分支。
 - **apply_patch 模糊匹配取首个命中**：`seekSequence` 在多个可替换位置时替换第一个匹配（确定性优先于"猜测意图"）。
 - **未做 Web UI**：当前只有 HTTP 端点，没有管理界面。
-- **本地 node 代理尚未透传 SSE（下一步）**：`/chat` 现在默认 SSE 流式，但 `web/server.mjs` 仍整段读取上游 body 并按 JSON 转发。本地代理目前仍然可用（`?stream=false` 会得到 JSON 封装；SSE body 会原样透传），但要通过本地代理实现真正的打字机效果，需要把 `/api/chat` 改为 SSE 透传（`pipeline(upstream.body, res)` + `text/event-stream`）——计划作为紧接着的下一步。在此之前浏览器可直连云端 `/chat`（SSE 响应已带 CORS 头）。
+- **本地 node 代理已透传 SSE**：`web/server.mjs` 的 `/api/chat` 把云端 SSE 响应流原样 pipe 给浏览器（`text/event-stream`，打字机效果可直接通过本地代理生效）；`?stream=false` / `{ "stream": false }` 仍走旧的一次性 JSON 转发。工具阶段的 `tool_call` / `tool_result` 事件也会随流一并透传。
 - **Matrix 接入预留**：`chat.ts` + `stop.ts` 已具备对话与中止能力，但尚未接入任何即时通讯协议。
 - **edgeone.json framework/outputDirectory（P2-8）**：Makers 平台配置待部署确认，暂不改动。
 - **无长期蒸馏策略**：`MEMORY.md` 由 AI 用 `blob_*` 自由读写（想写就写），不做全量 LLM 蒸馏；历史每次请求以标准 messages 数组注入，靠 auto-compact 折叠最旧 20% 控制长度（其余由网关上下文处理）。完整原始历史永不会丢——每条消息都以 append-only 方式归档进 `chatlog/`，可通过 `GET /history` 与 `chatlog_*` 工具查看。后续可升级为定期归纳日记为长期笔记。
 - **日记追加在极端并发下可能丢一条（P1-3）**：`appendDailyLog` 是非原子的读-改-写；同一日历日被并发追加时（公开 `/heartbeat` 可被并发 POST）最后写入者胜，可能丢掉一条记录。单写者（每小时一次 heartbeat）语义下安全；后续可引入 Blob append 原语修复。
 - **统一日期校验口径**：所有日记 / chatlog 读写路径都用 `dateFromDay` 的 round-trip 校验 `YYYY-MM-DD`，`2026-02-31` 这类不存在的日期在所有入口都会被拒绝（读路径返回 `null` / 错误，而不是去探测一个错误的 blob key）。
+- **只有流式路径展示思考过程**：chat 流式路径实时发出 `reasoning_delta`（DeepSeek 思考过程），但非流式 `chatCompletion` 路径（heartbeat/compact 同理）完全不解析 `reasoning_content`。由于 chat 工具回合现在全程流式（`streamed:true` + `tool_call`/`tool_result` 事件），所有 chat 回合都能看到思考过程——该限制如今只影响 heartbeat/compact 以及 `stream:false` 的 JSON chat 路径。
 
 ## 许可证
 
