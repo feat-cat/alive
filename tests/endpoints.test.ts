@@ -290,6 +290,210 @@ describe('POST /chat', () => {
     assert.equal(store.messageLog.at(-1)?.content, '我查完了，答案是 11。')
   })
 
+  test('tool-only rounds that exhaust CHAT_MAX_TURNS still reply with a body (not "（没有回复）") and keep intermediate text', async () => {
+    const store = makeMockStore()
+    const encoder = new TextEncoder()
+    const toolArgs = JSON.stringify({ query: 'x' })
+    const toolCallDelta = {
+      choices: [{
+        delta: {
+          tool_calls: [{ index: 0, id: 'call', type: 'function', function: { name: 'web_search', arguments: toolArgs } }],
+        },
+      }],
+    }
+    const stream = (chunks: unknown[]) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+        },
+      })
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      // Round 1: half a sentence + a tool call. Round 2: half a sentence + a
+      // tool call. Round 3: ANOTHER tool call with NO prose — the budget runs
+      // outs here, so every round requested a tool.
+      if (fetchCalls === 1) {
+        return stream([
+          { choices: [{ delta: { content: '好的，' } }] },
+          toolCallDelta,
+        ])
+      }
+      if (fetchCalls === 2) {
+        return stream([
+          { choices: [{ delta: { content: '我先查一下。' } }] },
+          toolCallDelta,
+        ])
+      }
+      return stream([toolCallDelta])
+    })
+
+    const res = await chatOnRequest(makeContext({ store, env: gatewayEnv() as Env, body: { message: '查一下' } }))
+    assert.equal(res.status, 200)
+    const bodyText = await res.text()
+    assert.equal(fetchCalls, 3) // all three rounds streamed through the gateway
+    // Intermediate round text is streamed to the client (typewriter).
+    assert.ok(bodyText.includes('"content":"好的，"'))
+    assert.ok(bodyText.includes('"content":"我先查一下。"'))
+    // The reply is NOT the misleading "（没有回复）" after a tool-only run — the
+    // accumulated intermediate words form the persisted reply.
+    assert.ok(!bodyText.includes('（没有回复）'))
+    assert.ok(!bodyText.includes('（这一轮以工具调用结束，没有生成正文）'))
+    assert.ok(bodyText.includes('data: [DONE]'))
+    // History keeps round 1 + round 2 intermediate text; every round's tool
+    // call was recorded BEFORE the final reply.
+    const toolRows = store.messageLog.filter((row) => row.role === 'assistant' && row.metadata?.kind === 'tool')
+    assert.equal(toolRows.length, 3)
+    assert.equal(store.messageLog.at(-1)?.role, 'assistant')
+    assert.equal(store.messageLog.at(-1)?.content, '好的，我先查一下。')
+  })
+
+  test('tool-only rounds with zero prose fall back to a neutral note when the budget is exhausted', async () => {
+    const store = makeMockStore()
+    const encoder = new TextEncoder()
+    const toolArgs = JSON.stringify({ query: 'x' })
+    const toolCallDelta = {
+      choices: [{ delta: { tool_calls: [{ index: 0, id: 'call', type: 'function', function: { name: 'web_search', arguments: toolArgs } }] } }],
+    }
+    mock.method(globalThis, 'fetch', async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(toolCallDelta)}\n\n`))
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+        },
+      })
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+
+    const res = await chatOnRequest(makeContext({ store, env: gatewayEnv() as Env, body: { message: '查一下' } }))
+    assert.equal(res.status, 200)
+    const bodyText = await res.text()
+    assert.ok(bodyText.includes('data: [DONE]'))
+    // No misleading "（没有回复）" — the neutral note explains the tool-only run,
+    // and the tool records were persisted before it.
+    assert.ok(!bodyText.includes('（没有回复）'))
+    assert.equal(store.messageLog.at(-1)?.role, 'assistant')
+    assert.equal(store.messageLog.at(-1)?.content, '（这一轮以工具调用结束，没有生成正文）')
+    const toolRows = store.messageLog.filter((row) => row.role === 'assistant' && row.metadata?.kind === 'tool')
+    assert.equal(toolRows.length, 3)
+  })
+
+  test('mixed turn: round 1 tool_calls + half-sentence, round 2 no tools -> reply concatenates both rounds (middle text kept)', async () => {
+    const store = makeMockStore()
+    const encoder = new TextEncoder()
+    const toolArgs = JSON.stringify({ query: 'x' })
+    const stream = (chunks: unknown[]) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+        },
+      })
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      if (fetchCalls === 1) {
+        // Round 1: the model says half a sentence AND asks for a tool.
+        return stream([
+          { choices: [{ delta: { content: '好的，' } }] },
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'web_search', arguments: toolArgs } }] } }] },
+        ])
+      }
+      // Round 2: the final answer, no more tools — the turn ends naturally.
+      return stream([
+        { choices: [{ delta: { content: '查完了，答案是 42。' } }] },
+      ])
+    })
+
+    const res = await chatOnRequest(makeContext({ store, env: gatewayEnv() as Env, body: { message: '查一下' } }))
+    assert.equal(res.status, 200)
+    const bodyText = await res.text()
+    assert.equal(fetchCalls, 2)
+    assert.ok(bodyText.includes('"content":"好的，"'))
+    assert.ok(bodyText.includes('"content":"查完了，答案是 42。"'))
+    assert.ok(bodyText.includes('"type":"tool_call"'))
+    assert.ok(bodyText.includes('data: [DONE]'))
+    // Reply = round 1 + round 2 text concatenated; the half-sentence is NOT lost.
+    const toolRows = store.messageLog.filter((row) => row.role === 'assistant' && row.metadata?.kind === 'tool')
+    assert.equal(toolRows.length, 1)
+    assert.equal(store.messageLog.at(-1)?.role, 'assistant')
+    assert.equal(store.messageLog.at(-1)?.content, '好的，查完了，答案是 42。')
+  })
+
+  test('JSON path (stream:false): tool rounds preserve intermediate half-sentences in the reply', async () => {
+    const store = makeMockStore()
+    const toolArgs = JSON.stringify({ query: 'x' })
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      if (fetchCalls === 1) {
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '好的，', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'web_search', arguments: toolArgs } }] } }],
+          }),
+          { status: 200 },
+        )
+      }
+      if (fetchCalls === 2) {
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '我先查一下。', tool_calls: [{ id: 'call_2', type: 'function', function: { name: 'web_search', arguments: toolArgs } }] } }],
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: '查完了，答案是 42。' } }] }), { status: 200 })
+    })
+
+    const res = await chatOnRequest(makeContext({
+      store,
+      env: gatewayEnv() as Env,
+      body: { message: '查一下', stream: false },
+    }))
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as { ok: boolean; reply: string }
+    assert.equal(fetchCalls, 3)
+    // Round 1 + round 2 prose survive the tool rounds — no more last-turn loss.
+    assert.equal(body.reply, '好的，我先查一下。查完了，答案是 42。')
+    assert.equal(store.messageLog.at(-1)?.role, 'assistant')
+    assert.equal(store.messageLog.at(-1)?.content, '好的，我先查一下。查完了，答案是 42。')
+    const toolRows = store.messageLog.filter((row) => row.role === 'assistant' && row.metadata?.kind === 'tool')
+    assert.equal(toolRows.length, 2)
+  })
+
+  test('JSON path (stream:false): a tool-only budget exhaustion returns the neutral note, not "（没有回复）"', async () => {
+    const store = makeMockStore()
+    const toolArgs = JSON.stringify({ query: 'x' })
+    mock.method(globalThis, 'fetch', async () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'web_search', arguments: toolArgs } }] } }],
+        }),
+        { status: 200 },
+      ))
+
+    const res = await chatOnRequest(makeContext({
+      store,
+      env: gatewayEnv() as Env,
+      body: { message: '查一下', stream: false },
+    }))
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as { ok: boolean; reply: string }
+    assert.equal(body.reply, '（这一轮以工具调用结束，没有生成正文）')
+    assert.equal(store.messageLog.at(-1)?.role, 'assistant')
+    assert.equal(store.messageLog.at(-1)?.content, '（这一轮以工具调用结束，没有生成正文）')
+    const toolRows = store.messageLog.filter((row) => row.role === 'assistant' && row.metadata?.kind === 'tool')
+    assert.equal(toolRows.length, 3)
+  })
+
   test('streaming gateway failure surfaces as an SSE error_message event', async () => {
     const store = makeMockStore()
     mock.method(globalThis, 'fetch', async () => new Response('boom', { status: 503 }))

@@ -165,7 +165,7 @@ curl https://<你的部署域名>/history?days=30 -H 'authorization: Bearer <tok
 - 流总是以 `data: [DONE]` 结束（另有约 5s 一次的 `ping` 帧保持长连接/代理存活）。
 - **无论是否调用工具，累积的完整回复都会落盘**到 store 历史 + chatlog 归档，每次实际执行过的工具也会以 `kind:'tool'` 历史条目记录。
 
-仍想要旧的一次性 JSON 的客户端可显式 `?stream=false`（query）或 `{ "stream": false }`（body），返回原来的 `{ ok, reply, conversationId, now }` 封装。
+仍想要旧的一次性 JSON 的客户端可显式 `?stream=false`（query）或 `{ "stream": false }`（body），返回原来的 `{ ok, reply, conversationId, now }` 封装。JSON 路径与流式语义对齐：每个工具轮的中间正文都会保留在 `reply` 里，纯工具轮耗尽 `CHAT_MAX_TURNS` 且没有任何正文时返回中性说明 `（这一轮以工具调用结束，没有生成正文）` 而不是空回复（heartbeat/compact 仍保持原有的"只取最终文字"行为）。
 
 ```bash
 # 打字机效果：`-N` 跟随输出，看到增量逐条到达

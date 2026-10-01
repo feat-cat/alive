@@ -55,6 +55,7 @@ import {
   isVisionUnsupportedError,
   safeParseArguments,
   streamChatCompletion,
+  TOOL_ONLY_REPLY_NOTE,
   type LlmContent,
   type LlmContentPart,
   type LlmMessage,
@@ -149,6 +150,9 @@ export async function runChat(
       signal,
       temperature: CHAT_TEMPERATURE,
       maxTokens: CHAT_MAX_TOKENS,
+      // JSON path mirrors the streaming path: keep every intermediate sentence
+      // and give a neutral note to a tool-only round instead of '（没有回复）'.
+      accumulateText: true,
     },
     hasImages,
   )
@@ -356,17 +360,22 @@ async function* streamChatTurn(
 ): AsyncGenerator<string> {
   let current = messages
   const toolResults: ToolRunRecord[] = []
-  let reply = '（没有回复）'
+  // Every round's spoken text is preserved — assistant content is retained even
+  // when a round ALSO requests tool calls (standard agent behaviour), so the
+  // final reply never loses the intermediate half-sentences.
+  const replyParts: string[] = []
+  let exhaustedByTurns = false
 
   for (let turn = 1; turn <= CHAT_MAX_TURNS; turn += 1) {
     if (signal?.aborted) throw abortError()
     const { fullText, toolCalls } = yield* streamOneTurn(context, conversationId, current, tools, signal)
 
+    // Accumulate whatever the model said this round. An empty-text round (model
+    // only emits tool_calls, no prose) must not affect later rounds.
+    if (fullText.trim()) replyParts.push(fullText.trim())
+
     // No tool work left: this round produced the final answer.
-    if (toolCalls.length === 0) {
-      reply = fullText.trim() || '（没有回复）'
-      break
-    }
+    if (toolCalls.length === 0) break
 
     // The model wants to ACT. Record the tool_calls on the assistant message,
     // execute each call (never crashing the turn — a throwing tool becomes an
@@ -392,8 +401,18 @@ async function* streamChatTurn(
     }
 
     // The turn budget was spent on this tool batch: persist what we have.
-    if (turn >= CHAT_MAX_TURNS) break
+    if (turn >= CHAT_MAX_TURNS) {
+      exhaustedByTurns = true
+      break
+    }
   }
+
+  // Reply: natural end → the accumulated text; budget exhausted with nothing
+  // spoken → a neutral note (the tool records already told the story), so we
+  // never fall back to the misleading "（没有回复）" after a tool-only turn.
+  const reply =
+    replyParts.join('') ||
+    (exhaustedByTurns ? TOOL_ONLY_REPLY_NOTE : '（没有回复）')
 
   // Tool records go into history BEFORE the final assistant reply.
   await recordToolCalls(context, conversationId, toolResults)

@@ -230,6 +230,14 @@ export interface ChatOptions {
   signal?: AbortSignal
   temperature?: number
   maxTokens?: number
+  /**
+   * When true, the returned text mirrors the streaming chat loop: every round's
+   * non-empty content is preserved (intermediate half-sentences survive tool
+   * rounds), and a budget-exhausted tool-only turn falls back to
+   * `TOOL_ONLY_REPLY_NOTE` instead of an empty reply. Defaults to false so
+   * heartbeat/compact (which only need the final text) keep their exact output.
+   */
+  accumulateText?: boolean
 }
 
 export interface ChatResult {
@@ -237,6 +245,9 @@ export interface ChatResult {
   turns: number
   toolResults: ToolRunRecord[]
 }
+
+/** Neutral reply for a tool-only turn that exhausts the turn budget (same wording as the streaming chat path). */
+export const TOOL_ONLY_REPLY_NOTE = '（这一轮以工具调用结束，没有生成正文）'
 
 export interface GatewayEnv {
   apiKey: string
@@ -427,9 +438,14 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
     maxTokens,
   } = options
   const maxTurns = Math.max(1, options.maxTurns ?? DEFAULT_MAX_TURNS)
+  const accumulateText = options.accumulateText === true
 
   const current: LlmMessage[] = messages.map((message) => ({ ...message }))
   const toolResults: ToolRunRecord[] = []
+  // Every round's spoken text is preserved (mirrors the streaming chat loop)
+  // when `accumulateText` is set, so the JSON path never loses the
+  // intermediate half-sentences that precede a tool round.
+  const parts: string[] = []
   let turns = 0
 
   while (turns < maxTurns) {
@@ -445,9 +461,16 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
       maxTokens,
     )
 
+    // Keep whatever the model said this round. An empty-text round (model only
+    // emits tool_calls, no prose) must not affect later rounds.
+    if (accumulateText && content.trim()) parts.push(content.trim())
+
     // No tool work left, or no runner to do it: return the final assistant text.
     if (toolCalls.length === 0 || !toolRunner) {
-      return { text: content, turns, toolResults }
+      if (!accumulateText) return { text: content, turns, toolResults }
+      // Natural end: the accumulated spoken text, or '' when the model produced
+      // nothing at all (the chat endpoint maps '' to '（没有回复）').
+      return { text: parts.join(''), turns, toolResults }
     }
 
     const assistantMessage: LlmMessage = { role: 'assistant', content, tool_calls: toolCalls }
@@ -480,14 +503,23 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
     // already recorded in toolResults/current, so don't drop it silently — the
     // final text may be empty because the turn ended on tool calls.
     if (turns >= maxTurns) {
-      const last = current.filter((message) => message.role === 'assistant').at(-1)
-      return { text: textOf(last), turns, toolResults }
+      if (!accumulateText) {
+        const last = current.filter((message) => message.role === 'assistant').at(-1)
+        return { text: textOf(last), turns, toolResults }
+      }
+      // Accumulated mode keeps every intermediate sentence; a tool-only round
+      // with nothing spoken gets the neutral note (same wording as streaming),
+      // never the misleading "（没有回复）".
+      return { text: parts.join('') || TOOL_ONLY_REPLY_NOTE, turns, toolResults }
     }
   }
 
   // Unreachable when maxTurns >= 1 (the loop always returns), kept for TS.
-  const last = current.filter((message) => message.role === 'assistant').at(-1)
-  return { text: textOf(last), turns, toolResults }
+  if (!accumulateText) {
+    const last = current.filter((message) => message.role === 'assistant').at(-1)
+    return { text: textOf(last), turns, toolResults }
+  }
+  return { text: parts.join(''), turns, toolResults }
 }
 
 /** Model-reply text from a message; multimodal array content yields ''. */

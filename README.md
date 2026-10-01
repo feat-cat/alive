@@ -190,7 +190,11 @@ default — the reply appears token-by-token instead of as one JSON blob:
 
 Clients that still want the old one-shot JSON can opt out explicitly with
 `?stream=false` (query) or `{ "stream": false }` (body); the response is then the
-original `{ ok, reply, conversationId, now }` envelope.
+original `{ ok, reply, conversationId, now }` envelope. The JSON path mirrors the
+streaming semantics: intermediate prose from every tool round is preserved in
+`reply`, and a tool-only turn that exhausts `CHAT_MAX_TURNS` with no spoken text
+returns the neutral note `（这一轮以工具调用结束，没有生成正文）` instead of an empty
+reply (heartbeat/compact keep their existing final-text-only behaviour).
 
 ```bash
 # Typewriter effect: pipe the SSE frames to see deltas as they arrive

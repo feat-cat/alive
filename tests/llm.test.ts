@@ -6,7 +6,7 @@
 import { afterEach, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mock } from 'node:test'
-import { buildChatBody, chatCompletion, degradeVisionMessages, isVisionUnsupportedError, streamChatCompletion, stripImageContent, withProviderMessageName, type LlmMessage, type LlmToolCall } from '../agents/_llm.ts'
+import { buildChatBody, chatCompletion, degradeVisionMessages, isVisionUnsupportedError, streamChatCompletion, stripImageContent, TOOL_ONLY_REPLY_NOTE, withProviderMessageName, type LlmMessage, type LlmToolCall } from '../agents/_llm.ts'
 import { gatewayEnv, makeContext } from './_helpers.ts'
 
 afterEach(() => {
@@ -204,6 +204,108 @@ describe('chatCompletion final turn (P2-2)', () => {
     assert.equal(result.toolResults[0]?.content, 'worked')
     // The turn ended on tool calls, so there is no assistant text yet.
     assert.equal(result.text, '')
+  })
+})
+
+describe('chatCompletion accumulated text (JSON path symmetry, P2-2)', () => {
+  test('accumulateText preserves intermediate half-sentences across tool rounds', async () => {
+    const toolArgs = JSON.stringify({ path: 'a.txt' })
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      if (fetchCalls === 1) {
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '好的，', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'echo', arguments: toolArgs } }] } }],
+          }),
+          { status: 200 },
+        )
+      }
+      if (fetchCalls === 2) {
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '我先查一下。', tool_calls: [{ id: 'call_2', type: 'function', function: { name: 'echo', arguments: toolArgs } }] } }],
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: '查完了，答案是 42。' } }] }), { status: 200 })
+    })
+
+    const result = await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      toolRunner: async () => ({ content: 'ok' }),
+      maxTurns: 3,
+      accumulateText: true,
+    })
+
+    assert.equal(fetchCalls, 3)
+    // Every round's prose survives the tool rounds (same semantics as streaming).
+    assert.equal(result.text, '好的，我先查一下。查完了，答案是 42。')
+  })
+
+  test('accumulateText maps a budget-exhausted tool-only round to the neutral note', async () => {
+    const toolArgs = JSON.stringify({ path: 'a.txt' })
+    mock.method(globalThis, 'fetch', async () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'echo', arguments: toolArgs } }] } }],
+        }),
+        { status: 200 },
+      ))
+
+    const result = await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      toolRunner: async () => ({ content: 'ok' }),
+      maxTurns: 3,
+      accumulateText: true,
+    })
+
+    // Not an empty reply — the same neutral note the streaming path uses.
+    assert.equal(result.text, TOOL_ONLY_REPLY_NOTE)
+  })
+
+  test('without accumulateText the default behaviour is unchanged (heartbeat/compact regression)', async () => {
+    const toolArgs = JSON.stringify({ path: 'a.txt' })
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      if (fetchCalls === 1) {
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '好的，', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'echo', arguments: toolArgs } }] } }],
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '', tool_calls: [{ id: 'call_2', type: 'function', function: { name: 'echo', arguments: toolArgs } }] } }],
+        }),
+        { status: 200 },
+      )
+    })
+
+    const result = await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      toolRunner: async () => ({ content: 'ok' }),
+      maxTurns: 2,
+    })
+
+    // Old behaviour: only the LAST round's assistant content ('' here); the
+    // intermediate '好的，' is dropped — heartbeat/compact rely on this.
+    assert.equal(result.text, '')
+    assert.equal(result.turns, 2)
+    assert.equal(result.toolResults.length, 2)
   })
 })
 
