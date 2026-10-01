@@ -32,6 +32,32 @@ export const PLAY_TURN_TIMEOUT_MS = 100_000
 /** Short LLM call timeout for a single gateway request. */
 export const LLM_TIMEOUT_MS = 90_000
 
+/**
+ * Max tool calls executed per round in an LLM loop — prevents a single turn
+ * from flooding the context with dozens of results while still allowing a
+ * small parallel batch. Single source of truth shared by the JSON loop
+ * (`_llm.ts`) and the streaming chat loop (`chat.ts`) so the two paths can
+ * never drift (P3-7).
+ */
+export const MAX_TOOLS_PER_TURN = 4
+
+/**
+ * Total budget for tool-result text回填 into the model context across ONE turn
+ * (P1-2). A chat turn can run 32 rounds × 4 tools; without a cumulative clamp
+ * the context would grow unboundedly (and the request would burn money). 32K
+ * chars is generous — a single result already clamps at 4K each — yet bounds a
+ * runaway tool session inside the DeepSeek V4 context budget.
+ */
+export const TOOL_RESULT_CONTEXT_BUDGET = 32_000
+
+/**
+ * User-facing message when an interactive chat turn exceeds its wall-clock
+ * budget (`CHAT_TURN_TIMEOUT_MS` in chat.ts). Thrown as an AbortError so
+ * `errorResponse` (JSON) and the SSE transport treat it as an abort while
+ * still surfacing this descriptive text (P2-3).
+ */
+export const CHAT_TIMEOUT_MESSAGE = '这条请求跑太久了，请重新发一次。'
+
 export interface Env {
   AI_GATEWAY_API_KEY?: string
   AI_GATEWAY_BASE_URL?: string
@@ -187,11 +213,24 @@ export function createSSEResponse(
         }
       } catch (error) {
         const err = error as Error
-        if (err.name !== 'AbortError' && !signal?.aborted && !cancelled) {
-          try {
-            controller.enqueue(encoder.encode(sseEvent({ type: 'error_message', content: err.message })))
-          } catch {
-            /* client disconnected while the error frame was enqueued */
+        // Client disconnects (signal aborted / cancelled) and generic aborts are
+        // silent, but a descriptive server-side abort (e.g. the chat wall-clock
+        // timeout carrying `CHAT_TIMEOUT_MESSAGE`) still surfaces an
+        // `error_message` frame so the user sees why the stream ended (P2-3).
+        if (!signal?.aborted && !cancelled) {
+          const isGenericAbort =
+            err instanceof Error &&
+            err.name === 'AbortError' &&
+            (err.message === 'Aborted' ||
+              err.message === 'LLM request aborted' ||
+              err.message === 'Request aborted' ||
+              !err.message)
+          if (!isGenericAbort) {
+            try {
+              controller.enqueue(encoder.encode(sseEvent({ type: 'error_message', content: err.message })))
+            } catch {
+              /* client disconnected while the error frame was enqueued */
+            }
           }
         }
       } finally {
@@ -307,7 +346,18 @@ export function jsonOk(payload: Record<string, unknown>): Response {
 export function errorResponse(error: unknown): Response {
   const message = error instanceof Error ? error.message : String(error)
   const aborted = error instanceof Error && (error.name === 'AbortError' || /aborted/i.test(message))
-  return jsonError(aborted ? 499 : 500, aborted ? 'Request aborted' : message)
+  if (aborted) {
+    // A descriptive abort message (e.g. the chat wall-clock timeout carrying
+    // `CHAT_TIMEOUT_MESSAGE`) keeps its text; the generic abort signals fall
+    // back to the standard "Request aborted".
+    const generic =
+      message === 'Request aborted' ||
+      message === 'Aborted' ||
+      message === 'LLM request aborted' ||
+      /aborted/i.test(message)
+    return jsonError(499, generic ? 'Request aborted' : message)
+  }
+  return jsonError(500, message)
 }
 
 /** Keep the first N bytes of a string (model context budget). */

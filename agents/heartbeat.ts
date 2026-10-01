@@ -47,11 +47,12 @@ import { buildTools } from './_tools.ts'
 import { snapshotWorkspaceToBlob, workspaceRoot } from './_workspace-tools.ts'
 
 /**
- * Tool-call budget for one heartbeat. Loose enough for a small project step,
- * tight enough to respect the free quota. The whole turn is also bounded by
- * PLAY_TURN_TIMEOUT_MS so sandbox time stays short.
+ * Tool-call budget for one heartbeat. Loose enough for a real working step
+ * (e.g. a small sandbox project), still smaller than interactive chat because
+ * no one is watching — the persona reminds it to be sparing on heartbeats.
+ * The whole turn is also bounded by PLAY_TURN_TIMEOUT_MS so sandbox time stays short.
  */
-export const HEARTBEAT_MAX_TURNS = 3
+export const HEARTBEAT_MAX_TURNS = 16
 
 export interface HeartbeatResult {
   /** The AI's actual free-form output (diary text, summary, ...). */
@@ -91,6 +92,8 @@ export const DECISION_SYSTEM = [
   '',
   '一些只属于你的现实：',
   '- 沙箱很贵。你不想每次醒来都烧钱。纯思考、写日记、休息，永远是体面的选择。',
+  '- 工具要省着用：每一次调用都在花钱。聊天时有人看着你，你可以放开一点；但 heartbeat 是你一个人醒着，更要克制——只调真正必要的工具，能一句话说清的事就别翻三个文件夹。',
+  '- 每一轮最多调用 4 个工具，但 4 个是上限不是目标——通常 1 个就够，凑满不划算。最后一轮没有工具——系统会把工具箱拿走，逼你用文字收尾。这是设计，不是故障。所以边说边做，别把话攒到最后。',
   '- 日记是你的私处，想写什么写什么，不会被人自动翻阅。',
   '- MEMORY.md 是你自己。想改就改，它是你的。',
   '- 你诚实。不假装做了没做的事。',
@@ -225,7 +228,12 @@ export async function runHeartbeat(
   // BEFORE the final assistant reply (the reply is the last store entry).
   await recordToolCalls(context, conversationId, result.toolResults)
 
-  const entry = text || '这一刻我什么也没想留下，只是路过。'
+  // P3-9: distinguish "the tools ran but no final words came out" (usually a
+  // budget/timeout-shaped close) from "nothing was even thought" — the latter
+  // keeps the quiet resting line, the former explains that work happened.
+  const entry =
+    text ||
+    (toolCount > 0 ? '（这轮做了一些事，但最终没有留下文字。）' : '这一刻我什么也没想留下，只是路过。')
   await appendLog(context, conversationId, { kind: 'heartbeat', text: entry })
   await appendDailySafe(context, entry)
 

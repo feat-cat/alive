@@ -237,6 +237,69 @@ describe('POST /heartbeat', () => {
     assert.ok(saved.lastActivityAt > 0)
   })
 
+  test('P2-6: a stub that requests a tool on every round still ends in words at the final turn (exactly HEARTBEAT_MAX_TURNS)', async () => {
+    const store = makeMockStore({ [SELF_ID]: { [SELF_STATE_KEY]: defaultSelfState() } })
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    const context = withGatewayEnv(store)
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      // Every round requests a tool; the final round still does, but tools are
+      // withheld there so the loop ignores the call and returns the words.
+      return new Response(
+        JSON.stringify({
+          choices: [{
+            message: {
+              content: fetchCalls === 16 ? '最后一句。' : '',
+              tool_calls: [{ id: `call_${fetchCalls}`, type: 'function', function: { name: 'blob_read', arguments: JSON.stringify({ key: 'memory/NOTES.md' }) } }],
+            },
+          }],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    })
+
+    const result = await runHeartbeat(context)
+
+    assert.equal(fetchCalls, 16) // terminated exactly at HEARTBEAT_MAX_TURNS
+    assert.ok(result.text.includes('最后一句。'))
+    // 15 tool calls ran (rounds 1-15); the final round's request was ignored.
+    assert.equal(result.toolCount, 15)
+    assert.equal(result.turns, 16)
+  })
+
+  test('P3-9: a tool-executing heartbeat with no final text logs the tools-ran note, not the resting line', async () => {
+    const store = makeMockStore({ [SELF_ID]: { [SELF_STATE_KEY]: defaultSelfState() } })
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    const context = withGatewayEnv(store)
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      if (fetchCalls === 1) {
+        return new Response(
+          JSON.stringify(llmToolCallResponse('blob_read', { key: 'memory/NOTES.md' })),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      // Final round: tools withheld, and the model produces no text at all.
+      return new Response(
+        JSON.stringify(llmTextResponse('')),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    })
+
+    const result = await runHeartbeat(context)
+
+    assert.equal(result.toolCount, 1)
+    assert.ok(result.text.includes('做了一些事'))
+    assert.ok(!result.text.includes('只是路过'))
+    // The quiet resting fallback stays for a zero-tool empty heartbeat.
+    const last = store.messageLog.at(-1)
+    assert.match(last?.content ?? '', /做了一些事/)
+  })
+
   test('gateway failure: runHeartbeat rejects, onRequest maps to a stable 500', async () => {
     const store = makeMockStore({ [SELF_ID]: { [SELF_STATE_KEY]: defaultSelfState() } })
     mockGatewayError(503)

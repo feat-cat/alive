@@ -87,7 +87,7 @@ alive/
 
 2. **Blob 强一致持久化，沙箱 /tmp 不持久** → workspace 写入即镜像 Blob。回合结束时若动用过 workspace，`snapshotWorkspaceToBlob` 把沙箱内容（含命令生成的产物）快照回 Blob，即使沙箱被回收，项目文件也不丢失。
 
-3. **单回合短时限、按需启动**。每次 heartbeat 的 LLM 循环受 `HEARTBEAT_MAX_TURNS=3` 和 100s 回合预算（`PLAY_TURN_TIMEOUT_MS`）约束；跑完立即快照并释放沙箱。不做长驻进程。
+3. **单回合短时限、按需启动**。每次 heartbeat 的 LLM 循环受 `HEARTBEAT_MAX_TURNS=16`（无人看着，比交互 chat 的 `CHAT_MAX_TURNS=32` 更省）和 100s 回合预算（`PLAY_TURN_TIMEOUT_MS`）约束；跑完立即快照并释放沙箱。不做长驻进程。
 
 4. **不复制 deepseek-harness 的常驻 sidecar 模式**——那会瞬间烧光免费配额。alive 的全部"生活"由 heartbeat schedules 触发，无请求即无成本。
 
@@ -95,7 +95,7 @@ alive/
 
 6. **统一会话**。heartbeat 与 chat 共用 `SELF_ID=eo-self` 同一份历史——AI 私下的思考与和用户的对话是一体的，跨请求、跨重启状态与记忆保持一致。
 
-7. **模型循环永远有上限**。所有 `chatCompletion` 都传 `maxTurns`（heartbeat=3，chat=3，compact=1），配合 90s LLM 超时。
+7. **模型循环永远有上限**。所有 `chatCompletion` 都传 `maxTurns`（heartbeat=16，chat=32，compact=1），配合 90s LLM 超时；每轮最多执行 `MAX_TOOLS_PER_TURN=4` 个工具（4 个是上限不是目标——人格提示告诉 AI 通常 1 个就够），整个回合回填给模型的工具结果有累计预算 `TOOL_RESULT_CONTEXT_BUDGET=32K`（超限后提前收尾，不再继续请求网关），最后一轮整个收起工具集逼模型用文字收尾；chat 还有独立于请求 signal 的 120s 墙钟预算（`CHAT_TURN_TIMEOUT_MS`）。
 
 8. **永不崩溃（规则 #11）**。所有端点用 `errorResponse` 把异常映射成稳定的 JSON 错误；工具执行器捕获错误并返回 `{ isError: true }` 而非抛出。
 
@@ -172,12 +172,12 @@ curl https://<你的部署域名>/history?days=30 -H 'authorization: Bearer <tok
   `{ "type": "reasoning_delta", "content": "<增量>" }`，且总是出现在最终正文之前。实时显示时，随附的 web 前端（`web/index.html`）会把这些增量折叠成可折叠「💭 思考过程」区块（同样有打字机效果）；落档时思考**按轮**进 JSON chatlog 记录（`reasoningContent`，每轮各占一条，不再跨轮拼接），工具记录携带对应的 `turn`。`/history` 与时间线按**真实事件序**穿插渲染（思考 → 工具 → 思考 → 工具 → 回答），每轮思考就紧挨在它所引发的工具之前，正文回答气泡收尾。思考只是刻意不进 compact 管理的 store 行，让模型上下文保持简洁；完整归档随时可通过 `/history` 与 `chatlog_*` 工具翻查。
 - **`tool_call` / `tool_result`（全程打字机）**——流式调用同样携带**完整工具集**，工具执行全程保持流式：模型请求工具时，累积的 tool_calls delta 会被还原成
   `{ "type": "tool_call", "name": "<工具名>", "arguments": <解析后的参数> }`（工具开始事件）与
-  `{ "type": "tool_result", "name": "<工具名>", "content": "<截断后的结果>" }`（工具结果事件）。结果会追加回消息数组，紧接着的下一轮 `streamChatCompletion` 继续流式输出正文——最终回复依旧是 `"streamed": true` 的 `ai_response`，**不再退化为一次性回复**。整个回合都被 `CHAT_MAX_TURNS` 约束；工具抛错也只会变成 `isError` 结果（规则 #11），不会中断流。
+  `{ "type": "tool_result", "name": "<工具名>", "content": "<截断后的结果>" }`（工具结果事件）。结果会追加回消息数组，紧接着的下一轮 `streamChatCompletion` 继续流式输出正文——最终回复依旧是 `"streamed": true` 的 `ai_response`，**不再退化为一次性回复**。整个回合都被 `CHAT_MAX_TURNS=32` 约束（用户在场，允许较长的工作回合）；每轮最多执行 `MAX_TOOLS_PER_TURN=4` 个工具，第 5 个起被截断、不执行也不记录；工具抛错也只会变成 `isError` 结果（规则 #11），不会中断流。最后一轮不再下发工具定义——即使模型（或测试 mock）仍吐出 `tool_calls` 也会被忽略，回合必须以文字结束。
 - **`error_message`**——流中途失败（如网关 5xx）以 `{ "type": "error_message", "content": "<消息>" }` 事件送达。
 - 流总是以 `data: [DONE]` 结束（另有约 5s 一次的 `ping` 帧保持长连接/代理存活）。
 - **无论是否调用工具，累积的完整回复都会落盘**到 store 历史 + chatlog 归档，每次实际执行过的工具也会以 `kind:'tool'` 历史条目记录。
 
-仍想要旧的一次性 JSON 的客户端可显式 `?stream=false`（query）或 `{ "stream": false }`（body），返回原来的 `{ ok, reply, conversationId, now }` 封装。JSON 路径与流式语义对齐：每个工具轮的中间正文都会保留在 `reply` 里，纯工具轮耗尽 `CHAT_MAX_TURNS` 且没有任何正文时返回中性说明 `（这一轮以工具调用结束，没有生成正文）` 而不是空回复（heartbeat/compact 仍保持原有的"只取最终文字"行为）。
+仍想要旧的一次性 JSON 的客户端可显式 `?stream=false`（query）或 `{ "stream": false }`（body），返回原来的 `{ ok, reply, conversationId, now }` 封装。JSON 路径与流式语义对齐：每个工具轮的中间正文都会保留在 `reply` 里，且最后一轮强制文字（同样的 `CHAT_MAX_TURNS` / `MAX_TOOLS_PER_TURN` 预算），正常收尾永远是模型自己说出的话；模型一句话都没说时兜底为更有信息量的 `（模型没有输出正文）`。旧的"纯工具轮返回中性说明 `（这一轮以工具调用结束，没有生成正文）`"只在**工具结果回填累计预算**（`TOOL_RESULT_CONTEXT_BUDGET`）把某个纯工具轮提前收尾时才出现，正常收尾绝不会用到；截断（工具数超过上限）时还会追加一条 system 注记，让模型知道第 5 个及之后的调用没被执行。两条路径都受同样的 120s 墙钟预算约束，超时会以清晰的 `这条请求跑太久了，请重新发一次。` 结束（heartbeat/compact 仍保持原有的"只取最终文字"行为）。
 
 ```bash
 # 打字机效果：`-N` 跟随输出，看到增量逐条到达

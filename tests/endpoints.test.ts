@@ -12,7 +12,7 @@ import assert from 'node:assert/strict'
 import { mock } from 'node:test'
 import { onRequest as chatOnRequest, runChat } from '../agents/chat.ts'
 import { onRequest as stopOnRequest, runStop } from '../agents/stop.ts'
-import { SELF_ID, type Env } from '../agents/_shared.ts'
+import { CHAT_TIMEOUT_MESSAGE, errorResponse, SELF_ID, type Env } from '../agents/_shared.ts'
 import { injectBlobStoreForTesting } from '../agents/_blob-tools.ts'
 import { dateKey } from '../agents/_memory.ts'
 import { gatewayEnv, makeContext, makeMockBlobStore, makeMockStore } from './_helpers.ts'
@@ -454,7 +454,7 @@ describe('POST /chat', () => {
     assert.equal(store.messageLog.at(-1)?.content, '我查完了，答案是 11。')
   })
 
-  test('tool-only rounds that exhaust CHAT_MAX_TURNS still reply with a body (not "（没有回复）") and keep intermediate text', async () => {
+  test('tool rounds end in a forced-text final round: reply keeps intermediate prose and every tool round is recorded', async () => {
     const store = makeMockStore()
     const encoder = new TextEncoder()
     const toolArgs = JSON.stringify({ query: 'x' })
@@ -479,8 +479,8 @@ describe('POST /chat', () => {
     mock.method(globalThis, 'fetch', async () => {
       fetchCalls += 1
       // Round 1: half a sentence + a tool call. Round 2: half a sentence + a
-      // tool call. Round 3: ANOTHER tool call with NO prose — the budget runs
-      // outs here, so every round requested a tool.
+      // tool call. Round 3: the model answers in WORDS — the final round has no
+      // tools, so even a stub asking for one would be ignored.
       if (fetchCalls === 1) {
         return stream([
           { choices: [{ delta: { content: '好的，' } }] },
@@ -493,58 +493,73 @@ describe('POST /chat', () => {
           toolCallDelta,
         ])
       }
-      return stream([toolCallDelta])
+      return stream([
+        { choices: [{ delta: { content: '查完了，答案是 11。' } }] },
+      ])
     })
 
     const res = await chatOnRequest(makeContext({ store, env: gatewayEnv() as Env, body: { message: '查一下' } }))
     assert.equal(res.status, 200)
     const bodyText = await res.text()
-    assert.equal(fetchCalls, 3) // all three rounds streamed through the gateway
+    assert.equal(fetchCalls, 3) // two tool rounds + one forced-text final round
     // Intermediate round text is streamed to the client (typewriter).
     assert.ok(bodyText.includes('"content":"好的，"'))
     assert.ok(bodyText.includes('"content":"我先查一下。"'))
-    // The reply is NOT the misleading "（没有回复）" after a tool-only run — the
-    // accumulated intermediate words form the persisted reply.
+    assert.ok(bodyText.includes('"content":"查完了，答案是 11。"'))
+    // The final round ended in words — no "（没有回复）" and no neutral note.
     assert.ok(!bodyText.includes('（没有回复）'))
     assert.ok(!bodyText.includes('（这一轮以工具调用结束，没有生成正文）'))
     assert.ok(bodyText.includes('data: [DONE]'))
-    // History keeps round 1 + round 2 intermediate text; every round's tool
-    // call was recorded BEFORE the final reply.
+    // History keeps round 1 + round 2 intermediate text plus round 3's answer;
+    // only rounds 1-2 recorded a tool (the final round had none).
     const toolRows = store.messageLog.filter((row) => row.role === 'assistant' && row.metadata?.kind === 'tool')
-    assert.equal(toolRows.length, 3)
+    assert.equal(toolRows.length, 2)
     assert.equal(store.messageLog.at(-1)?.role, 'assistant')
-    assert.equal(store.messageLog.at(-1)?.content, '好的，我先查一下。')
+    assert.equal(store.messageLog.at(-1)?.content, '好的，我先查一下。查完了，答案是 11。')
   })
 
-  test('tool-only rounds with zero prose fall back to a neutral note when the budget is exhausted', async () => {
+  test('tool-only rounds with zero prose end in a forced-text final round: pure-text answer, no neutral note', async () => {
     const store = makeMockStore()
     const encoder = new TextEncoder()
     const toolArgs = JSON.stringify({ query: 'x' })
     const toolCallDelta = {
       choices: [{ delta: { tool_calls: [{ index: 0, id: 'call', type: 'function', function: { name: 'web_search', arguments: toolArgs } }] } }],
     }
-    mock.method(globalThis, 'fetch', async () => {
+    const stream = (chunks: unknown[]) => {
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(toolCallDelta)}\n\n`))
+          for (const chunk of chunks) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
           controller.enqueue(encoder.encode('data: [DONE]\n\n'))
           controller.close()
         },
       })
       return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      // Rounds 1-2: pure tool calls with zero prose. Round 3: the final round
+      // withholds tools, so the model answers in words — no neutral note.
+      if (fetchCalls <= 2) return stream([toolCallDelta])
+      return stream([
+        { choices: [{ delta: { content: '查完了。' } }] },
+      ])
     })
 
     const res = await chatOnRequest(makeContext({ store, env: gatewayEnv() as Env, body: { message: '查一下' } }))
     assert.equal(res.status, 200)
     const bodyText = await res.text()
+    assert.equal(fetchCalls, 3)
     assert.ok(bodyText.includes('data: [DONE]'))
-    // No misleading "（没有回复）" — the neutral note explains the tool-only run,
-    // and the tool records were persisted before it.
+    assert.ok(bodyText.includes('"content":"查完了。"'))
+    // The forced-text final round replaces the old neutral note: the reply is
+    // the model's actual words.
     assert.ok(!bodyText.includes('（没有回复）'))
+    assert.ok(!bodyText.includes('（这一轮以工具调用结束，没有生成正文）'))
     assert.equal(store.messageLog.at(-1)?.role, 'assistant')
-    assert.equal(store.messageLog.at(-1)?.content, '（这一轮以工具调用结束，没有生成正文）')
+    assert.equal(store.messageLog.at(-1)?.content, '查完了。')
     const toolRows = store.messageLog.filter((row) => row.role === 'assistant' && row.metadata?.kind === 'tool')
-    assert.equal(toolRows.length, 3)
+    assert.equal(toolRows.length, 2)
   })
 
   test('mixed turn: round 1 tool_calls + half-sentence, round 2 no tools -> reply concatenates both rounds (middle text kept)', async () => {
@@ -633,16 +648,27 @@ describe('POST /chat', () => {
     assert.equal(toolRows.length, 2)
   })
 
-  test('JSON path (stream:false): a tool-only budget exhaustion returns the neutral note, not "（没有回复）"', async () => {
+  test('JSON path (stream:false): tool-only rounds end in a forced-text final round (no neutral note)', async () => {
     const store = makeMockStore()
     const toolArgs = JSON.stringify({ query: 'x' })
-    mock.method(globalThis, 'fetch', async () =>
-      new Response(
-        JSON.stringify({
-          choices: [{ message: { content: '', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'web_search', arguments: toolArgs } }] } }],
-        }),
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      // Rounds 1-2: pure tool calls with zero prose. Round 3: the final round
+      // withholds tools, so the model answers in words — the reply is the text.
+      if (fetchCalls <= 2) {
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '', tool_calls: [{ id: `call_${fetchCalls}`, type: 'function', function: { name: 'web_search', arguments: toolArgs } }] } }],
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: '查完了，答案是 42。' } }] }),
         { status: 200 },
-      ))
+      )
+    })
 
     const res = await chatOnRequest(makeContext({
       store,
@@ -651,11 +677,12 @@ describe('POST /chat', () => {
     }))
     assert.equal(res.status, 200)
     const body = (await res.json()) as { ok: boolean; reply: string }
-    assert.equal(body.reply, '（这一轮以工具调用结束，没有生成正文）')
+    assert.equal(body.reply, '查完了，答案是 42。')
     assert.equal(store.messageLog.at(-1)?.role, 'assistant')
-    assert.equal(store.messageLog.at(-1)?.content, '（这一轮以工具调用结束，没有生成正文）')
+    assert.equal(store.messageLog.at(-1)?.content, '查完了，答案是 42。')
+    // Rounds 1-2 recorded their tools; the forced-text final round had none.
     const toolRows = store.messageLog.filter((row) => row.role === 'assistant' && row.metadata?.kind === 'tool')
-    assert.equal(toolRows.length, 3)
+    assert.equal(toolRows.length, 2)
   })
 
   test('streaming gateway failure surfaces as an SSE error_message event', async () => {
@@ -869,6 +896,232 @@ describe('POST /chat', () => {
     assert.equal(res.status, 500) // errorResponse maps the gateway 400 to a stable 500
     const body = (await res.json()) as { ok: boolean; error: string }
     assert.match(body.error, /AI gateway HTTP 400/)
+  })
+
+  test('P1-2: the streaming turn winds down once the cumulative tool-result budget is spent', async () => {
+    const store = makeMockStore()
+    const blob = makeMockBlobStore({ 'memory/big.txt': 'x'.repeat(4000) })
+    injectBlobStoreForTesting(blob)
+    const encoder = new TextEncoder()
+    const toolArgs = JSON.stringify({ key: 'memory/big.txt' })
+    const fourToolDelta = {
+      choices: [{
+        delta: {
+          tool_calls: Array.from({ length: 4 }, (_, i) => ({
+            index: i,
+            id: `call_${i + 1}`,
+            type: 'function',
+            function: { name: 'blob_read', arguments: toolArgs },
+          })),
+        },
+      }],
+    }
+    const stream = (chunks: unknown[]) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+        },
+      })
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      // Rounds 1-2: 4×4000-char blob reads each (32K total). Round 3: one more
+      // read would push past the budget, so the turn winds down immediately.
+      if (fetchCalls <= 2) return stream([fourToolDelta])
+      if (fetchCalls === 3) {
+        return stream([
+          { choices: [{ delta: { content: '到这里预算不够了，我先停手。' } }] },
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_9', type: 'function', function: { name: 'blob_read', arguments: toolArgs } }] } }] },
+        ])
+      }
+      return stream([{ choices: [{ delta: { content: '不该到达的第 4 轮。' } }] }])
+    })
+
+    const res = await chatOnRequest(makeContext({ store, env: gatewayEnv() as Env, body: { message: '查一下' } }))
+    assert.equal(res.status, 200)
+    const bodyText = await res.text()
+    // The wind-down happens on round 3 — no round 4 fetch is ever made.
+    assert.equal(fetchCalls, 3)
+    // 4 + 4 + 1 tools executed before the wind-down.
+    assert.equal((bodyText.match(/"type":"tool_result"/g) ?? []).length, 9)
+    assert.equal(store.messageLog.at(-1)?.role, 'assistant')
+    assert.equal(store.messageLog.at(-1)?.content, '到这里预算不够了，我先停手。')
+  })
+
+  test('P2-6: the streaming final round ignores a stubborn tool_call and ends in words (exactly CHAT_MAX_TURNS rounds)', async () => {
+    const store = makeMockStore()
+    const encoder = new TextEncoder()
+    const toolArgs = JSON.stringify({ query: 'x' })
+    const toolCallDelta = {
+      choices: [{ delta: { tool_calls: [{ index: 0, id: 'call', type: 'function', function: { name: 'web_search', arguments: toolArgs } }] } }],
+    }
+    const stream = (chunks: unknown[]) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+        },
+      })
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }
+    let fetchCalls = 0
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      fetchCalls += 1
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      if (fetchCalls < 32) return stream([toolCallDelta])
+      // Final round: tools are withheld, but the stub STILL emits a tool_call
+      // delta plus words — the turn must end in words anyway.
+      return stream([
+        toolCallDelta,
+        { choices: [{ delta: { content: '最后的话。' } }] },
+      ])
+    })
+
+    const res = await chatOnRequest(makeContext({ store, env: gatewayEnv() as Env, body: { message: '查一下' } }))
+    assert.equal(res.status, 200)
+    const bodyText = await res.text()
+    assert.equal(fetchCalls, 32) // terminated exactly at CHAT_MAX_TURNS, no infinite loop
+    assert.ok(bodyText.includes('"content":"最后的话。"'))
+    assert.ok(bodyText.includes('data: [DONE]'))
+    assert.equal(store.messageLog.at(-1)?.role, 'assistant')
+    assert.equal(store.messageLog.at(-1)?.content, '最后的话。')
+    // The final round withholds tools: its request body carries no tools key.
+    assert.ok(bodies.length >= 32)
+    assert.ok(Array.isArray(bodies[0]?.tools), 'a normal round carries the tool definitions')
+    assert.ok(!('tools' in (bodies[31] ?? {})), 'the final round must not send tools (forced text)')
+  })
+
+  test('P2-6/P2-5: streaming 5→4 truncation keeps the wire consistent and appends the truncation note', async () => {
+    const store = makeMockStore()
+    const encoder = new TextEncoder()
+    const fiveToolDelta = {
+      choices: [{
+        delta: {
+          tool_calls: Array.from({ length: 5 }, (_, i) => ({
+            index: i,
+            id: `call_${i + 1}`,
+            type: 'function',
+            function: { name: 'web_search', arguments: JSON.stringify({ query: `q${i}` }) },
+          })),
+        },
+      }],
+    }
+    const stream = (chunks: unknown[]) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+        },
+      })
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }
+    let fetchCalls = 0
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      fetchCalls += 1
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      if (fetchCalls === 1) return stream([fiveToolDelta])
+      return stream([{ choices: [{ delta: { content: 'done' } }] }])
+    })
+
+    const res = await chatOnRequest(makeContext({ store, env: gatewayEnv() as Env, body: { message: '查一下' } }))
+    assert.equal(res.status, 200)
+    const bodyText = await res.text()
+    assert.equal(fetchCalls, 2)
+    // Only 4 of the 5 requested tools executed.
+    assert.equal((bodyText.match(/"type":"tool_result"/g) ?? []).length, 4)
+    assert.equal((bodyText.match(/"type":"tool_call"/g) ?? []).length, 4)
+
+    // The final-round request carries the truncated assistant tool_calls (P1-1)
+    // plus the truncation note (P2-5).
+    assert.ok(bodies.length >= 2)
+    const sent = bodies[1]?.messages as Array<Record<string, unknown>>
+    const assistant = sent.find((message) => message?.role === 'assistant')
+    assert.ok(assistant, 'final-round body carries the assistant tool_calls message')
+    const toolCalls = assistant?.tool_calls as Array<{ id: string }>
+    assert.equal(toolCalls.length, 4)
+    const toolResults = sent.filter((message) => message?.role === 'tool')
+    assert.equal(toolResults.length, 4)
+    for (const call of toolCalls) {
+      assert.ok(
+        toolResults.some((message) => message?.tool_call_id === call.id),
+        `tool_call ${call.id} has a matching role:'tool' result`,
+      )
+    }
+    assert.ok(
+      sent.some((message) => message?.role === 'system' && String(message?.content).includes('本轮工具数达到上限 4')),
+      'the truncation note is appended for the model',
+    )
+  })
+
+  test('P2-6: an empty final-round reply falls back to the descriptive（模型没有输出正文）', async () => {
+    const store = makeMockStore()
+    const encoder = new TextEncoder()
+    mock.method(globalThis, 'fetch', async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+          controller.close()
+        },
+      })
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+
+    const res = await chatOnRequest(makeContext({ store, env: gatewayEnv() as Env, body: { message: '你好' } }))
+    assert.equal(res.status, 200)
+    await res.text()
+    // No ai_response deltas were emitted, yet the persisted reply is informative.
+    assert.equal(store.messageLog.at(-1)?.role, 'assistant')
+    assert.equal(store.messageLog.at(-1)?.content, '（模型没有输出正文）')
+  })
+
+  test('P2-6: JSON path (stream:false) maps an empty model reply to the descriptive fallback', async () => {
+    const store = makeMockStore()
+    mock.method(globalThis, 'fetch', async () =>
+      new Response(JSON.stringify(llmTextResponse('')), { status: 200 }))
+
+    const res = await chatOnRequest(makeContext({
+      store,
+      env: gatewayEnv() as Env,
+      body: { message: '你好', stream: false },
+    }))
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as { ok: boolean; reply: string }
+    assert.equal(body.reply, '（模型没有输出正文）')
+    assert.equal(store.messageLog.at(-1)?.role, 'assistant')
+    assert.equal(store.messageLog.at(-1)?.content, '（模型没有输出正文）')
+  })
+
+  test('P2-3: JSON path rejects with the descriptive wall-clock timeout message', async () => {
+    const store = makeMockStore()
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      // Hang until the turn budget's abort fires (never resolves on its own).
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted by budget')))
+      })
+    })
+
+    await assert.rejects(
+      runChat(makeContext({ store, env: gatewayEnv() as Env }), { message: 'hi', timeoutMs: 5 }),
+      (error: unknown) =>
+        error instanceof Error && error.name === 'AbortError' && error.message.includes('跑太久了'),
+    )
+  })
+
+  test('P2-3: errorResponse maps the descriptive chat timeout AbortError to a clear 499 body', async () => {
+    const error = new Error(CHAT_TIMEOUT_MESSAGE)
+    error.name = 'AbortError'
+    const res = errorResponse(error)
+    assert.equal(res.status, 499)
+    const body = (await res.json()) as { ok: boolean; error: string }
+    assert.equal(body.error, CHAT_TIMEOUT_MESSAGE)
   })
 })
 

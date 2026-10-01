@@ -13,9 +13,7 @@ async function drain(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<v
     const { done } = await reader.read()
     if (done) break
   }
-}
-
-describe('createSSEResponse client disconnect (P2-7)', () => {
+}describe('createSSEResponse client disconnect (P2-7)', () => {
   test('cancel() resolves and the response stays drainable without throwing', async () => {
     async function* gen(): AsyncGenerator<string> {
       yield sseEvent({ type: 'ai_response', content: 'a' })
@@ -64,5 +62,31 @@ describe('createSSEResponse client disconnect (P2-7)', () => {
     // Draining the cancelled stream must never reject — the loop observed the
     // cancelled flag and never attempted the error frame on the dead controller.
     await assert.doesNotReject(() => drain(reader))
+  })
+})
+
+describe('createSSEResponse descriptive abort messages (P2-3)', () => {
+  test('a server-side AbortError with a descriptive message surfaces as error_message', async () => {
+    async function* gen(): AsyncGenerator<string> {
+      yield sseEvent({ type: 'ai_response', content: '开始' })
+      const error = new Error('这条请求跑太久了，请重新发一次。')
+      error.name = 'AbortError'
+      throw error
+    }
+    const res = createSSEResponse(gen)
+    const bodyText = await res.text()
+    assert.ok(bodyText.includes('"type":"error_message"'))
+    assert.ok(bodyText.includes('这条请求跑太久了，请重新发一次。'))
+  })
+
+  test('a generic AbortError stays silent (no error_message frame)', async () => {
+    async function* gen(): AsyncGenerator<string> {
+      const error = new Error('Aborted')
+      error.name = 'AbortError'
+      throw error
+    }
+    const res = createSSEResponse(gen)
+    const bodyText = await res.text()
+    assert.ok(!bodyText.includes('"type":"error_message"'))
   })
 })

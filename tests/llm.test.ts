@@ -174,12 +174,24 @@ describe('chatCompletion tool abort checkpoints (P2-1)', () => {
   })
 })
 
-describe('chatCompletion final turn (P2-2)', () => {
-  test('executes tool calls on the last turn instead of dropping them', async () => {
+describe('chatCompletion final turn (forced text)', () => {
+  test('final round withholds tools: a stub still returning tool_calls is ignored and the turn ends in words', async () => {
     let fetchCalls = 0
     mock.method(globalThis, 'fetch', async () => {
       fetchCalls += 1
-      return new Response(JSON.stringify(toolCallsResponse({ name: 'echo', arguments: '{}' })), { status: 200 })
+      // The model (or a stub) still asks for a tool on the final round — the
+      // loop withholds tools there, so the request MUST be ignored.
+      return new Response(
+        JSON.stringify({
+          choices: [{
+            message: {
+              content: '最后的话。',
+              tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'echo', arguments: '{}' } }],
+            },
+          }],
+        }),
+        { status: 200 },
+      )
     })
     const called: string[] = []
 
@@ -195,15 +207,13 @@ describe('chatCompletion final turn (P2-2)', () => {
       maxTurns: 1,
     })
 
-    // The work happened on the final (and only) turn and was recorded.
+    // fetchCalls hit the budget; no tool ran; the turn ended with the model's
+    // words instead of a tool call.
     assert.equal(fetchCalls, 1)
-    assert.deepEqual(called, ['echo'])
+    assert.deepEqual(called, [])
     assert.equal(result.turns, 1)
-    assert.equal(result.toolResults.length, 1)
-    assert.equal(result.toolResults[0]?.name, 'echo')
-    assert.equal(result.toolResults[0]?.content, 'worked')
-    // The turn ended on tool calls, so there is no assistant text yet.
-    assert.equal(result.text, '')
+    assert.equal(result.toolResults.length, 0)
+    assert.equal(result.text, '最后的话。')
   })
 })
 
@@ -247,15 +257,26 @@ describe('chatCompletion accumulated text (JSON path symmetry, P2-2)', () => {
     assert.equal(result.text, '好的，我先查一下。查完了，答案是 42。')
   })
 
-  test('accumulateText maps a budget-exhausted tool-only round to the neutral note', async () => {
+  test('last round is forced to words: tool-only rounds 1-2 then a pure-text final round (no neutral note)', async () => {
     const toolArgs = JSON.stringify({ path: 'a.txt' })
-    mock.method(globalThis, 'fetch', async () =>
-      new Response(
-        JSON.stringify({
-          choices: [{ message: { content: '', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'echo', arguments: toolArgs } }] } }],
-        }),
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      if (fetchCalls === 1 || fetchCalls === 2) {
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '', tool_calls: [{ id: `call_${fetchCalls}`, type: 'function', function: { name: 'echo', arguments: toolArgs } }] } }],
+          }),
+          { status: 200 },
+        )
+      }
+      // The final round is forced to text — the model answers in words and the
+      // conversation closes normally, never with the tool-only neutral note.
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: '查完了，答案是 42。' } }] }),
         { status: 200 },
-      ))
+      )
+    })
 
     const result = await chatCompletion({
       context,
@@ -267,11 +288,16 @@ describe('chatCompletion accumulated text (JSON path symmetry, P2-2)', () => {
       accumulateText: true,
     })
 
-    // Not an empty reply — the same neutral note the streaming path uses.
-    assert.equal(result.text, TOOL_ONLY_REPLY_NOTE)
+    // Rounds 1-2 ran their tool; round 3 was the budgeted text answer.
+    assert.equal(fetchCalls, 3)
+    assert.equal(result.turns, 3)
+    assert.equal(result.toolResults.length, 2)
+    assert.equal(result.text, '查完了，答案是 42。')
+    // A normal close must never fall back to the neutral note.
+    assert.notEqual(result.text, TOOL_ONLY_REPLY_NOTE)
   })
 
-  test('without accumulateText the default behaviour is unchanged (heartbeat/compact regression)', async () => {
+  test('without accumulateText the last-round tool request is ignored (heartbeat/compact regression)', async () => {
     const toolArgs = JSON.stringify({ path: 'a.txt' })
     let fetchCalls = 0
     mock.method(globalThis, 'fetch', async () => {
@@ -301,20 +327,30 @@ describe('chatCompletion accumulated text (JSON path symmetry, P2-2)', () => {
       maxTurns: 2,
     })
 
-    // Old behaviour: only the LAST round's assistant content ('' here); the
-    // intermediate '好的，' is dropped — heartbeat/compact rely on this.
+    // Non-accumulate keeps the heartbeat/compact contract: only the LAST round's
+    // assistant content is returned ('' here); the intermediate '好的，' is
+    // dropped. New behaviour: the last round withholds tools, so round 2's
+    // requested tool is IGNORED — only round 1's tool ran.
     assert.equal(result.text, '')
     assert.equal(result.turns, 2)
-    assert.equal(result.toolResults.length, 2)
+    assert.equal(result.toolResults.length, 1)
+    assert.equal(result.toolResults[0]?.name, 'echo')
   })
 })
 
 describe('chatCompletion OpenAI tool schema (P2-11)', () => {
   test('sends tools with parameters wrapped as a full JSON Schema object ({ type: "object", properties, required })', async () => {
     const bodies: Array<Record<string, unknown>> = []
+    let fetchCalls = 0
     mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      fetchCalls += 1
       if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
-      return new Response(JSON.stringify(toolCallsResponse({ name: 'echo', arguments: '{}' })), { status: 200 })
+      // Round 1 (non-final) carries the tools so the wrapped schema can be
+      // inspected; round 2 is the forced-text close.
+      if (fetchCalls === 1) {
+        return new Response(JSON.stringify(toolCallsResponse({ name: 'echo', arguments: '{}' })), { status: 200 })
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'done' } }] }), { status: 200 })
     })
 
     await chatCompletion({
@@ -332,7 +368,7 @@ describe('chatCompletion OpenAI tool schema (P2-11)', () => {
         },
       ],
       toolRunner: async () => ({ content: 'ok' }),
-      maxTurns: 1,
+      maxTurns: 2,
     })
 
     assert.ok(bodies.length >= 1)
@@ -362,9 +398,14 @@ describe('chatCompletion OpenAI tool schema (P2-11)', () => {
 
   test('wraps empty parameters as { type: "object", properties: {}, required: [] }', async () => {
     const bodies: Array<Record<string, unknown>> = []
+    let fetchCalls = 0
     mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      fetchCalls += 1
       if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
-      return new Response(JSON.stringify(toolCallsResponse({ name: 'echo', arguments: '{}' })), { status: 200 })
+      if (fetchCalls === 1) {
+        return new Response(JSON.stringify(toolCallsResponse({ name: 'echo', arguments: '{}' })), { status: 200 })
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'done' } }] }), { status: 200 })
     })
 
     await chatCompletion({
@@ -373,7 +414,7 @@ describe('chatCompletion OpenAI tool schema (P2-11)', () => {
       messages: [{ role: 'user', content: 'go' }],
       tools,
       toolRunner: async () => ({ content: 'ok' }),
-      maxTurns: 1,
+      maxTurns: 2,
     })
 
     assert.ok(bodies.length >= 1)
@@ -541,6 +582,235 @@ describe('chatCompletion tool arguments (P2-9)', () => {
 
     assert.deepEqual(received, { path: 'b.txt', n: 2 })
     assert.deepEqual(result.toolResults[0]?.args, { path: 'b.txt', n: 2 })
+  })
+})
+
+describe('chatCompletion per-round tool cap (MAX_TOOLS_PER_TURN)', () => {
+  test('a round requesting 5 tools executes only the first 4; the 5th is truncated', async () => {
+    let fetchCalls = 0
+    const fiveCalls = Array.from({ length: 5 }, (_, i) => ({ name: 'echo', arguments: JSON.stringify({ n: i }) }))
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      if (fetchCalls === 1) {
+        return new Response(JSON.stringify(toolCallsResponse(...fiveCalls)), { status: 200 })
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'done' } }] }), { status: 200 })
+    })
+    const called: string[] = []
+
+    const result = await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      toolRunner: async (name) => {
+        called.push(name)
+        return { content: 'ok' }
+      },
+      maxTurns: 2,
+    })
+
+    // Round 1 (non-final) requested 5 tools but only 4 ran; the 5th was cut and
+    // never recorded. Round 2 is the forced-text close.
+    assert.equal(fetchCalls, 2)
+    assert.equal(called.length, 4)
+    assert.equal(result.toolResults.length, 4)
+    assert.deepEqual(result.toolResults.map((run) => run.name), ['echo', 'echo', 'echo', 'echo'])
+    assert.equal(result.toolResults[4], undefined)
+    assert.equal(result.text, 'done')
+  })
+
+  test('P1-1: the assistant tool_calls and the execution loop share the truncated array — no dangling ids', async () => {
+    let fetchCalls = 0
+    const fiveCalls = Array.from({ length: 5 }, (_, i) => ({ name: 'echo', arguments: JSON.stringify({ n: i }) }))
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      fetchCalls += 1
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      if (fetchCalls === 1) {
+        return new Response(JSON.stringify(toolCallsResponse(...fiveCalls)), { status: 200 })
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'done' } }] }), { status: 200 })
+    })
+    const called: string[] = []
+
+    await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      toolRunner: async (name) => {
+        called.push(name)
+        return { content: 'ok' }
+      },
+      maxTurns: 2,
+    })
+
+    assert.equal(called.length, 4)
+    assert.ok(bodies.length >= 2)
+    const sent = bodies[1]?.messages as Array<Record<string, unknown>>
+    const assistant = sent.find((message) => message?.role === 'assistant')
+    assert.ok(assistant, 'round 2 body carries the assistant tool_calls message')
+    const toolCalls = assistant?.tool_calls as Array<{ id: string; function: { name: string; arguments: string } }>
+    // Only the first 4 calls are declared — call_5 is NOT on the wire.
+    assert.equal(toolCalls.length, 4)
+    const toolResults = sent.filter((message) => message?.role === 'tool')
+    assert.equal(toolResults.length, 4)
+    // Every declared id has a matching role:'tool' result — no dangling tool_call.
+    for (const call of toolCalls) {
+      assert.ok(
+        toolResults.some((message) => message?.tool_call_id === call.id),
+        `tool_call ${call.id} has a matching role:'tool' result`,
+      )
+    }
+    assert.equal(called[4], undefined)
+  })
+
+  test('P2-5: a truncation note is appended only when tool_calls actually exceed MAX_TOOLS_PER_TURN', async () => {
+    let fetchCalls = 0
+    const fiveCalls = Array.from({ length: 5 }, (_, i) => ({ name: 'echo', arguments: JSON.stringify({ n: i }) }))
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      fetchCalls += 1
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      if (fetchCalls === 1) {
+        return new Response(JSON.stringify(toolCallsResponse(...fiveCalls)), { status: 200 })
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'done' } }] }), { status: 200 })
+    })
+
+    await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      toolRunner: async () => ({ content: 'ok' }),
+      maxTurns: 2,
+    })
+
+    assert.ok(bodies.length >= 2)
+    const sent = bodies[1]?.messages as Array<Record<string, unknown>>
+    const note = sent.find((message) => message?.role === 'system' && String(message?.content).includes('本轮工具数达到上限 4'))
+    assert.ok(note, 'the truncation note tells the model that 4+ calls were cut')
+
+    // A normal 1-4 tool round appends NO note.
+    fetchCalls = 0
+    const bodies2: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      fetchCalls += 1
+      if (init?.body) bodies2.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      if (fetchCalls === 1) {
+        return new Response(JSON.stringify(toolCallsResponse({ name: 'echo', arguments: '{}' })), { status: 200 })
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), { status: 200 })
+    })
+    await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      toolRunner: async () => ({ content: 'ok' }),
+      maxTurns: 2,
+    })
+    const allMessages = JSON.stringify(bodies2[1]?.messages ?? [])
+    assert.ok(!allMessages.includes('本轮工具数达到上限'), 'a normal single-tool round must not append the truncation note')
+  })
+})
+
+describe('chatCompletion cumulative tool-result context budget (P1-2)', () => {
+  test('stop回填 results and wind down once the cumulative budget is spent — no further gateway request', async () => {
+    const big = 'x'.repeat(4000)
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      // Rounds 1-2: 4 tool calls each (4×4000 = 16K per round, 32K total).
+      // Round 3: a single tool call would push past the 32K budget.
+      if (fetchCalls <= 2) {
+        const calls = Array.from({ length: 4 }, (_, i) => ({ id: `call_${fetchCalls}_${i}`, type: 'function', function: { name: 'echo', arguments: JSON.stringify({ n: i }) } }))
+        return new Response(JSON.stringify({ choices: [{ message: { content: '', tool_calls: calls } }] }), { status: 200 })
+      }
+      if (fetchCalls === 3) {
+        return new Response(JSON.stringify({ choices: [{ message: { content: '到这里预算不够了，我先停手。', tool_calls: [{ id: 'call_3_0', type: 'function', function: { name: 'echo', arguments: '{}' } }] } }] }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: '不该到达的第 4 轮。' } }] }), { status: 200 })
+    })
+
+    const result = await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      toolRunner: async () => ({ content: big }),
+      maxTurns: 10,
+      accumulateText: true,
+    })
+
+    // Round 3's tool run pushed the cumulative byte count over budget, so the
+    // turn winds down immediately — no round 4, no further gateway request.
+    assert.equal(fetchCalls, 3)
+    assert.ok(result.text.includes('到这里预算不够了，我先停手。'))
+    // 4 + 4 + 1 tools executed before the wind-down.
+    assert.equal(result.toolResults.length, 9)
+  })
+
+  test('P2-6: a maxTurns all-tool stub terminates exactly at maxTurns with a final text reply', async () => {
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      return new Response(
+        JSON.stringify({
+          choices: [{
+            message: {
+              content: fetchCalls < 8 ? '' : '收尾的话。',
+              tool_calls: [{ id: `call_${fetchCalls}`, type: 'function', function: { name: 'echo', arguments: '{}' } }],
+            },
+          }],
+        }),
+        { status: 200 },
+      )
+    })
+
+    const result = await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      toolRunner: async () => ({ content: 'ok' }),
+      maxTurns: 8,
+    })
+
+    // The final round withheld tools; the stub's tool_calls was ignored and the
+    // turn ended in words.
+    assert.equal(fetchCalls, 8)
+    assert.equal(result.turns, 8)
+    assert.equal(result.text, '收尾的话。')
+    assert.equal(result.toolResults.length, 7)
+  })
+
+  test('P2-6: the final round request body carries no tools key', async () => {
+    let fetchCalls = 0
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      fetchCalls += 1
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      if (fetchCalls === 1) {
+        return new Response(JSON.stringify(toolCallsResponse({ name: 'echo', arguments: '{}' })), { status: 200 })
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'done' } }] }), { status: 200 })
+    })
+
+    await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      tools,
+      toolRunner: async () => ({ content: 'ok' }),
+      maxTurns: 2,
+    })
+
+    assert.ok(bodies.length >= 2)
+    assert.ok(Array.isArray(bodies[0]?.tools), 'round 1 carries the tool definitions')
+    assert.ok(!('tools' in (bodies[1] ?? {})), 'the final round must not send tools (forced text)')
   })
 })
 

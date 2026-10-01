@@ -36,7 +36,10 @@
  * the original one-shot JSON envelope via `runChat`.
  */
 import {
+  CHAT_TIMEOUT_MESSAGE,
+  MAX_TOOLS_PER_TURN,
   SELF_ID,
+  TOOL_RESULT_CONTEXT_BUDGET,
   asMakersContext,
   clampText,
   createSSEResponse,
@@ -55,6 +58,7 @@ import {
   isVisionUnsupportedError,
   safeParseArguments,
   streamChatCompletion,
+  truncatedToolsNote,
   TOOL_ONLY_REPLY_NOTE,
   type LlmContent,
   type LlmContentPart,
@@ -75,7 +79,19 @@ import {
 } from './_memory.ts'
 import { buildTools } from './_tools.ts'
 
-const CHAT_MAX_TURNS = 3
+// Generous budget for interactive chat: the user is present and can stop the
+// turn, so a long working session (e.g. sandbox exploration) is allowed.
+// The persona/memory still tells it to be sparing — see DECISION_SYSTEM.
+const CHAT_MAX_TURNS = 32
+/** Tools shape with zero definitions — used on the final turn so the model can't
+ * request tools and MUST answer in words. `run` is unreachable (the gateway
+ * sees no tool definitions) but kept for type compatibility. */
+const EMPTY_TOOLS: ReturnType<typeof buildTools> = {
+  definitions: [],
+  run: () => {
+    throw new Error('EMPTY_TOOLS.run should never be called')
+  },
+}
 const CHAT_TEMPERATURE = 0.7
 const CHAT_MAX_TOKENS = 600
 /** Tool-result characters sent back to the model (same budget as `_llm`'s clamp). */
@@ -91,12 +107,71 @@ const MAX_IMAGE_BYTES = 4 * 1024 * 1024
 /** Every image must be a local `data:image/...;base64,...` URL. */
 const IMAGE_DATA_URL_RE = /^data:image\/[a-z0-9.+-]+;base64,/i
 
+/**
+ * Wall-clock budget for ONE interactive chat turn (P2-3). Chat has no
+ * heartbeat-style 100s deadline today, so a tool-heavy loop could run many
+ * minutes under only the request AbortSignal. 120s keeps an interactive session
+ * generous while still bounding spend — heartbeat reserves 100s for autonomous
+ * turns; chat is user-facing so it gets a slightly larger share and the user
+ * can always stop earlier with /stop or a disconnect.
+ */
+const CHAT_TURN_TIMEOUT_MS = 120_000
+
+/**
+ * Combine the external request signal with a wall-clock turn budget (P2-3).
+ * The returned signal aborts when EITHER the client disconnects or the budget
+ * expires; `expired()` distinguishes the two so callers can surface a clear
+ * "这条请求跑太久了" error instead of a silent client-style abort. Both signals
+ * are listened to, so the request `signal` keeps passing through unchanged.
+ * `timeoutMs` is an injectable test seam (defaults to CHAT_TURN_TIMEOUT_MS).
+ */
+function createTurnBudget(
+  external: AbortSignal | undefined,
+  timeoutMs = CHAT_TURN_TIMEOUT_MS,
+): {
+  signal: AbortSignal
+  expired: () => boolean
+  dispose: () => void
+} {
+  const controller = new AbortController()
+  let expired = false
+  const timer = setTimeout(() => {
+    expired = true
+    controller.abort()
+  }, timeoutMs)
+  const onAbort = () => controller.abort()
+  if (external?.aborted) controller.abort()
+  external?.addEventListener('abort', onAbort, { once: true })
+  return {
+    signal: controller.signal,
+    expired: () => expired,
+    dispose: () => {
+      clearTimeout(timer)
+      external?.removeEventListener('abort', onAbort)
+    },
+  }
+}
+
+/** AbortError carrying the user-facing wall-clock message (P2-3). errorResponse
+ * (JSON) and the SSE transport both surface descriptive abort messages. */
+function chatTimeoutError(): Error {
+  const error = new Error(CHAT_TIMEOUT_MESSAGE)
+  error.name = 'AbortError'
+  return error
+}
+
 export interface ChatTurnOptions {
   message: string
   /** Base64 `data:` image URLs to send as OpenAI `image_url` content parts. */
   images?: string[]
   conversationId?: string
   signal?: AbortSignal
+  /**
+   * Wall-clock budget for one turn in ms; defaults to `CHAT_TURN_TIMEOUT_MS`.
+   * Internal/test seam — the endpoint never sets it, but callers may tighten
+   * the budget (or tests inject a tiny value to exercise the timeout path).
+   */
+  timeoutMs?: number
 }
 
 export type ChatResult = {
@@ -109,7 +184,7 @@ export async function runChat(
   context: MakersContext,
   options: ChatTurnOptions,
 ): Promise<ChatResult> {
-  const { message, images: imagesOption = [], conversationId: conversationIdOption, signal } = options
+  const { message, images: imagesOption = [], conversationId: conversationIdOption, signal, timeoutMs } = options
   const images = validateImages(imagesOption.filter(isNonEmptyString))
   const hasImages = images.length > 0
   const conversationId = conversationIdOption?.trim() || SELF_ID
@@ -132,67 +207,76 @@ export async function runChat(
   // message (appended above), so it flows to the model as its own entry.
   const history = await loadMessages(context, conversationId)
 
-  // Full tool registry like heartbeat: the model can chat AND act (blob_*,
-  // diary_*, chatlog_*, workspace_*, web_search). No 100s turn budget here —
-  // only the request AbortSignal bounds the loop/tools.
-  const tools = buildTools({ context, conversationId, signal })
+  // Wall-clock budget for the whole turn (P2-3): independent of the client's
+  // request signal so a tool-heavy loop cannot run forever; the timeout aborts
+  // the internal signal and surfaces CHAT_TIMEOUT_MESSAGE instead of a silent
+  // client-style abort.
+  const budget = createTurnBudget(signal, timeoutMs)
+  const tools = buildTools({ context, conversationId, signal: budget.signal })
   const baseMessages: LlmMessage[] = [
     { role: 'system', content: `${persona}\n\n${SYSTEM_HISTORY_GUIDANCE}` },
     ...history,
   ]
-  const result = await chatCompletionWithVisionFallback(
-    {
-      context,
-      conversationId,
-      messages: baseMessages,
-      tools: tools.definitions,
-      toolRunner: tools.run,
-      maxTurns: CHAT_MAX_TURNS,
-      signal,
-      temperature: CHAT_TEMPERATURE,
-      maxTokens: CHAT_MAX_TOKENS,
-      // JSON path mirrors the streaming path: keep every intermediate sentence
-      // and give a neutral note to a tool-only round instead of '（没有回复）'.
-      accumulateText: true,
-    },
-    hasImages,
-  )
+  try {
+    const result = await chatCompletionWithVisionFallback(
+      {
+        context,
+        conversationId,
+        messages: baseMessages,
+        tools: tools.definitions,
+        toolRunner: tools.run,
+        maxTurns: CHAT_MAX_TURNS,
+        signal: budget.signal,
+        temperature: CHAT_TEMPERATURE,
+        maxTokens: CHAT_MAX_TOKENS,
+        // JSON path mirrors the streaming path: keep every intermediate sentence
+        // and give a neutral note to a tool-only round instead of an empty reply.
+        accumulateText: true,
+      },
+      hasImages,
+    )
 
-  // Persist the per-round timeline into the chatlog archive. Chat respects the
-  // TRUE event order (思考 → 工具 → 思考 → 工具 → 回答): every intermediate round
-  // archives its own thinking as a chatlog-only assistant record (never the
-  // store), tool records carry the round's `turn`, and the final reply closes
-  // the turn sequence. The store itself stays unchanged — same tool rows + one
-  // final assistant reply as before; turn/reasoning travel only in JSON records.
-  const turnRecords = result.turnRecords
-  const lastTurn = turnRecords.length > 0 ? (turnRecords[turnRecords.length - 1]?.turn ?? 1) : 1
-  for (const record of turnRecords) {
-    const hasContent = record.text.trim().length > 0
-    const hasReasoning = typeof record.reasoning === 'string' && record.reasoning.trim().length > 0
-    // Intermediate rounds: archive the round's thinking/prose with its turn
-    // (chatlog only). The last round is written once below with the full reply.
-    if (record.turn < lastTurn && (hasContent || hasReasoning)) {
-      await archiveChatlogBestEffort(context, {
-        role: 'assistant',
-        content: record.text.trim(),
-        kind: 'assistant',
-        reasoningContent: hasReasoning ? (record.reasoning as string).trim() : undefined,
-        turn: record.turn,
-      })
+    // Persist the per-round timeline into the chatlog archive. Chat respects the
+    // TRUE event order (思考 → 工具 → 思考 → 工具 → 回答): every intermediate round
+    // archives its own thinking as a chatlog-only assistant record (never the
+    // store), tool records carry the round's `turn`, and the final reply closes
+    // the turn sequence. The store itself stays unchanged — same tool rows + one
+    // final assistant reply as before; turn/reasoning travel only in JSON records.
+    const turnRecords = result.turnRecords
+    const lastTurn = turnRecords.length > 0 ? (turnRecords[turnRecords.length - 1]?.turn ?? 1) : 1
+    for (const record of turnRecords) {
+      const hasContent = record.text.trim().length > 0
+      const hasReasoning = typeof record.reasoning === 'string' && record.reasoning.trim().length > 0
+      // Intermediate rounds: archive the round's thinking/prose with its turn
+      // (chatlog only). The last round is written once below with the full reply.
+      if (record.turn < lastTurn && (hasContent || hasReasoning)) {
+        await archiveChatlogBestEffort(context, {
+          role: 'assistant',
+          content: record.text.trim(),
+          kind: 'assistant',
+          reasoningContent: hasReasoning ? (record.reasoning as string).trim() : undefined,
+          turn: record.turn,
+        })
+      }
+      if (record.toolResults.length > 0) {
+        await recordToolCalls(context, conversationId, record.toolResults, { turn: record.turn })
+      }
     }
-    if (record.toolResults.length > 0) {
-      await recordToolCalls(context, conversationId, record.toolResults, { turn: record.turn })
-    }
+
+    const lastReasoning = turnRecords.length > 0 ? turnRecords[turnRecords.length - 1]?.reasoning : undefined
+    const reply = result.text.trim() || '（模型没有输出正文）'
+    await persistHistory(context, conversationId, 'assistant', reply, {
+      reasoningContent: lastReasoning?.trim() || undefined,
+      turn: lastTurn,
+    })
+
+    return { reply, conversationId, now: nowIso() }
+  } catch (error) {
+    if (budget.expired()) throw chatTimeoutError()
+    throw error
+  } finally {
+    budget.dispose()
   }
-
-  const lastReasoning = turnRecords.length > 0 ? turnRecords[turnRecords.length - 1]?.reasoning : undefined
-  const reply = result.text.trim() || '（没有回复）'
-  await persistHistory(context, conversationId, 'assistant', reply, {
-    reasoningContent: lastReasoning?.trim() || undefined,
-    turn: lastTurn,
-  })
-
-  return { reply, conversationId, now: nowIso() }
 }
 
 /** Run `chatCompletion`, retrying once WITHOUT images when the gateway rejects them. */
@@ -272,7 +356,7 @@ async function* chatStreamGenerator(
   context: MakersContext,
   options: ChatTurnOptions,
 ): AsyncGenerator<string> {
-  const { message, images: imagesOption = [], conversationId: conversationIdOption, signal } = options
+  const { message, images: imagesOption = [], conversationId: conversationIdOption, signal, timeoutMs } = options
   const images = validateImages(imagesOption.filter(isNonEmptyString))
   const hasImages = images.length > 0
   const conversationId = conversationIdOption?.trim() || SELF_ID
@@ -291,17 +375,28 @@ async function* chatStreamGenerator(
     { role: 'system', content: `${persona}\n\n${SYSTEM_HISTORY_GUIDANCE}` },
     ...history,
   ]
-  const tools = buildTools({ context, conversationId, signal })
+  // Wall-clock budget for the whole turn (P2-3): independent of the client's
+  // request signal so a tool-heavy streaming loop cannot run forever; on
+  // expiry the descriptive CHAT_TIMEOUT_MESSAGE error replaces a silent abort.
+  const budget = createTurnBudget(signal, timeoutMs)
+  const tools = buildTools({ context, conversationId, signal: budget.signal })
 
-  for (let attempt = 1; attempt <= MAX_VISION_ATTEMPTS; attempt += 1) {
-    try {
-      yield* streamChatTurn(context, conversationId, attempt === 1 ? messages : degradeVisionMessages(messages), tools, signal)
-      return
-    } catch (error) {
-      // Only retry when this turn actually carried images AND the gateway says
-      // the model cannot see. Anything else propagates to an error_message frame.
-      if (attempt >= MAX_VISION_ATTEMPTS || !hasImages || !isVisionUnsupportedError(error)) throw error
+  try {
+    for (let attempt = 1; attempt <= MAX_VISION_ATTEMPTS; attempt += 1) {
+      try {
+        yield* streamChatTurn(context, conversationId, attempt === 1 ? messages : degradeVisionMessages(messages), tools, budget.signal)
+        return
+      } catch (error) {
+        // Only retry when this turn actually carried images AND the gateway says
+        // the model cannot see. Anything else propagates to an error_message frame.
+        if (attempt >= MAX_VISION_ATTEMPTS || !hasImages || !isVisionUnsupportedError(error)) throw error
+      }
     }
+  } catch (error) {
+    if (budget.expired()) throw chatTimeoutError()
+    throw error
+  } finally {
+    budget.dispose()
   }
 }
 
@@ -406,19 +501,28 @@ async function* streamChatTurn(
   // when a round ALSO requests tool calls (standard agent behaviour), so the
   // final reply never loses the intermediate half-sentences.
   const replyParts: string[] = []
-  let exhaustedByTurns = false
+  // Cumulative tool-result回填 budget (P1-2): results stop being回填 into
+  // `current` once the total exceeds TOOL_RESULT_CONTEXT_BUDGET, and the turn
+  // then winds down instead of starting another gateway request.
+  let toolResultBytes = 0
 
   for (let turn = 1; turn <= CHAT_MAX_TURNS; turn += 1) {
     if (signal?.aborted) throw abortError()
-    const { fullText, reasoning, toolCalls } = yield* streamOneTurn(context, conversationId, current, tools, signal)
+    // Last round: tools are withheld so the model MUST answer in words — it
+    // can't end the conversation with a tool call. (The persona/memory already
+    // explains this so the model isn't surprised.)
+    const turnTools = turn >= CHAT_MAX_TURNS ? EMPTY_TOOLS : tools
+    const { fullText, reasoning, toolCalls } = yield* streamOneTurn(context, conversationId, current, turnTools, signal)
 
     // Accumulate whatever the model said this round. An empty-text round (model
     // only emits tool_calls, no prose) must not affect later rounds.
     if (fullText.trim()) replyParts.push(fullText.trim())
 
-    // No tool work left: this round produced the final answer.
-    if (toolCalls.length === 0) {
-      const reply = replyParts.join('') || (exhaustedByTurns ? TOOL_ONLY_REPLY_NOTE : '（没有回复）')
+    // No tool work left (or the final round withheld tools): this round produced
+    // the final answer. Even if the model still returned tool_calls on the last
+    // round, they are ignored — the turn must end in words.
+    if (toolCalls.length === 0 || turn >= CHAT_MAX_TURNS) {
+      const reply = replyParts.join('') || '（模型没有输出正文）'
       await persistHistory(context, conversationId, 'assistant', reply, {
         reasoningContent: reasoning.trim() || undefined,
         turn,
@@ -430,9 +534,14 @@ async function* streamChatTurn(
     // The model wants to ACT. Record the tool_calls on the assistant message,
     // execute each call (never crashing the turn — a throwing tool becomes an
     // `isError` result), emit progress events, and feed the results back.
-    current = [...current, { role: 'assistant', content: fullText, tool_calls: toolCalls }]
+    // Per-round cap (P1-1): the assistant message and the execution loop share
+    // the SAME truncated array so a round requesting more than MAX_TOOLS_PER_TURN
+    // tools never leaves dangling tool_calls on the wire.
+    const callsToRun = toolCalls.slice(0, MAX_TOOLS_PER_TURN)
+    current = [...current, { role: 'assistant', content: fullText, tool_calls: callsToRun }]
     const roundToolResults: ToolRunRecord[] = []
-    for (const call of toolCalls) {
+    let budgetExceeded = false
+    for (const call of callsToRun) {
       if (signal?.aborted) throw abortError()
       const args = safeParseArguments(call.arguments)
       yield sseEvent({ type: 'tool_call', name: call.name, arguments: args })
@@ -448,7 +557,18 @@ async function* streamChatTurn(
         content: modelText,
       })
       yield sseEvent({ type: 'tool_result', name: call.name, content: clampText(result.content, CLIENT_TOOL_RESULT_MAX) })
-      current = [...current, { role: 'tool', tool_call_id: call.id, name: call.name, content: modelText }]
+      if (!budgetExceeded && toolResultBytes + modelText.length > TOOL_RESULT_CONTEXT_BUDGET) {
+        budgetExceeded = true
+      }
+      if (!budgetExceeded) {
+        toolResultBytes += modelText.length
+        current = [...current, { role: 'tool', tool_call_id: call.id, name: call.name, content: modelText }]
+      }
+    }
+    // The 5th+ tool calls were cut this round — tell the model so it knows the
+    // work was NOT done (P2-5). Only when a truncation actually happened.
+    if (toolCalls.length > callsToRun.length) {
+      current = [...current, truncatedToolsNote(MAX_TOOLS_PER_TURN, toolCalls.length)]
     }
 
     // Archive this round's own thinking/prose (chatlog-only, never the store)
@@ -466,11 +586,10 @@ async function* streamChatTurn(
       await recordToolCalls(context, conversationId, roundToolResults, { turn })
     }
 
-    // The turn budget was spent on this tool batch: close the turn sequence.
-    if (turn >= CHAT_MAX_TURNS) {
-      exhaustedByTurns = true
-      // Reply: budget exhausted with nothing spoken → a neutral note (the tool
-      // records already told the story), never the misleading "（没有回复）".
+    // Context budget spent (P1-2): wind down now — this round's prose is the
+    // final reply and no further gateway request is made. (Unlike the old
+    // `turn >= CHAT_MAX_TURNS` tool-exhaustion branch, this IS reachable.)
+    if (budgetExceeded) {
       const reply = replyParts.join('') || TOOL_ONLY_REPLY_NOTE
       await persistHistory(context, conversationId, 'assistant', reply, { turn })
       yield sseDone()
@@ -479,7 +598,7 @@ async function* streamChatTurn(
   }
 
   // Unreachable in practice (an answer round returns above); kept for TS.
-  const reply = replyParts.join('') || '（没有回复）'
+  const reply = replyParts.join('') || '（模型没有输出正文）'
   await persistHistory(context, conversationId, 'assistant', reply, { turn: CHAT_MAX_TURNS })
   yield sseDone()
 }

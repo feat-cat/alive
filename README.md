@@ -88,7 +88,7 @@ Only `heartbeat.ts`, `chat.ts`, `history.ts`, `stop.ts` are routable endpoints; 
 
 2. **Blob strong-consistency persistence; sandbox /tmp is not persistent** → workspace writes are mirrored to Blob immediately. At turn end, if the workspace was touched, `snapshotWorkspaceToBlob` snapshots the sandbox contents (including command-generated files) back to Blob, so even if the sandbox is recycled, project files survive.
 
-3. **Short bounded turns, on-demand startup.** Each heartbeat LLM loop is bounded by `HEARTBEAT_MAX_TURNS=3` and a 100s turn budget (`PLAY_TURN_TIMEOUT_MS`); after the turn the sandbox is snapshotted and released. No long-lived processes.
+3. **Short bounded turns, on-demand startup.** Each heartbeat LLM loop is bounded by `HEARTBEAT_MAX_TURNS=16` (no one is watching, so it stays more frugal than interactive chat's `CHAT_MAX_TURNS=32`) and a 100s turn budget (`PLAY_TURN_TIMEOUT_MS`); after the turn the sandbox is snapshotted and released. No long-lived processes.
 
 4. **No deepseek-harness persistent-sidecar pattern** — that would burn through the free quota instantly. alive's whole "life" is triggered by the heartbeat schedule; no request, no cost.
 
@@ -96,7 +96,7 @@ Only `heartbeat.ts`, `chat.ts`, `history.ts`, `stop.ts` are routable endpoints; 
 
 6. **Unified conversation.** `SELF_ID=eo-self` for everything — heartbeat AND chat share one history, so the agent's private thoughts and its conversations with the user are one continuous self. State and memory stay consistent across requests and restarts.
 
-7. **Every model loop is bounded.** All `chatCompletion` calls pass `maxTurns` (heartbeat=3, chat=3, compact=1) with a 90s LLM timeout.
+7. **Every model loop is bounded.** All `chatCompletion` calls pass `maxTurns` (heartbeat=16, chat=32, compact=1) with a 90s LLM timeout. Each round executes at most `MAX_TOOLS_PER_TURN=4` tools (4 is a ceiling, not a target — the persona tells the AI that usually one is enough), tool-result text回填 across the whole turn is capped by `TOOL_RESULT_CONTEXT_BUDGET=32K` (after which the turn winds down early instead of growing the context without bound), the final round withholds tools entirely so the model must close the turn in words, and chat additionally has a 120s wall-clock budget (`CHAT_TURN_TIMEOUT_MS`) independent of the request signal.
 
 8. **Never crash (rule #11).** All endpoints wrap logic in `errorResponse` mapping exceptions to stable JSON errors; tool executors catch errors and return `{ isError: true }` instead of throwing.
 
@@ -224,10 +224,13 @@ default — the reply appears token-by-token instead of as one JSON blob:
   args> }` (tool start) and `{ "type": "tool_result", "name": "<name>",
   "content": "<clamped result>" }` (tool result). The result is appended to the
   message array and the next `streamChatCompletion` round streams again — the
-  final answer is a normal `ai_response` with `"streamed": true`. The whole
-  turn stays typewriter, never degrading to a one-shot reply. The loop is
-  bounded by `CHAT_MAX_TURNS`, and a throwing tool becomes an `isError` result
-  (rule #11) instead of crashing the stream.
+   final answer is a normal `ai_response` with `"streamed": true`. The whole
+   turn stays typewriter, never degrading to a one-shot reply. The loop is
+   bounded by `CHAT_MAX_TURNS` (32, the user is present so a long working
+   session is allowed), each round executes at most `MAX_TOOLS_PER_TURN=4`
+   tools, and a throwing tool becomes an `isError` result (rule #11) instead of
+   crashing the stream. The final round withholds tools entirely — even a model
+   that still emits `tool_calls` there is forced to end the turn in words.
 - **`error_message`** — a mid-stream failure (e.g. gateway 5xx) arrives as
   `{ "type": "error_message", "content": "<message>" }` inside the stream.
 - The stream always ends with a `data: [DONE]` sentinel (plus a ~5s `ping` frame
@@ -239,9 +242,17 @@ Clients that still want the old one-shot JSON can opt out explicitly with
 `?stream=false` (query) or `{ "stream": false }` (body); the response is then the
 original `{ ok, reply, conversationId, now }` envelope. The JSON path mirrors the
 streaming semantics: intermediate prose from every tool round is preserved in
-`reply`, and a tool-only turn that exhausts `CHAT_MAX_TURNS` with no spoken text
-returns the neutral note `（这一轮以工具调用结束，没有生成正文）` instead of an empty
-reply (heartbeat/compact keep their existing final-text-only behaviour).
+`reply`, and the final round is forced to text (same `CHAT_MAX_TURNS` /
+`MAX_TOOLS_PER_TURN` budget) so a normal close is always the model's own words.
+When the model produces no text at all the reply falls back to the descriptive
+`（模型没有输出正文）`; the tool-only neutral note `（这一轮以工具调用结束，没有生成正文）`
+is reserved for a tool-only round that is cut short by the cumulative
+tool-result context budget (`TOOL_RESULT_CONTEXT_BUDGET`), never for a normal
+close (heartbeat/compact keep their existing final-text-only behaviour). A
+truncated round (more than `MAX_TOOLS_PER_TURN` tool calls) also appends a
+system note so the model knows its 5th+ calls were not executed. Both paths
+carry the same 120s wall-clock chat budget; an over-budget turn ends with a
+clear `这条请求跑太久了，请重新发一次。` message.
 
 ```bash
 # Typewriter effect: pipe the SSE frames to see deltas as they arrive

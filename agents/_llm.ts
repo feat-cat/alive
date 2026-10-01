@@ -14,6 +14,8 @@ import {
   DEFAULT_MAX_TURNS,
   DEFAULT_MODEL,
   LLM_TIMEOUT_MS,
+  MAX_TOOLS_PER_TURN,
+  TOOL_RESULT_CONTEXT_BUDGET,
   type MakersContext,
 } from './_shared.ts'
 
@@ -275,8 +277,24 @@ export interface ChatResult {
   turnRecords: ChatTurnArchive[]
 }
 
-/** Neutral reply for a tool-only turn that exhausts the turn budget (same wording as the streaming chat path). */
+/** Neutral reply for a tool-only turn whose context budget forces an early close (same wording as the streaming chat path). */
 export const TOOL_ONLY_REPLY_NOTE = '（这一轮以工具调用结束，没有生成正文）'
+
+/**
+ * Note appended when a round's tool_calls exceed `MAX_TOOLS_PER_TURN`: the
+ * model must know its 5th+ calls were NOT executed so it can retry on the next
+ * round (P2-5). Sent as a system message (not role:'tool') so the strict
+ * gateway serde never sees a tool_call_id with no matching assistant tool_calls
+ * entry — a fabricated `tool_call_id:'truncated'` would risk a 400.
+ */
+export function truncatedToolsNote(maxPerTurn: number, requested: number): LlmMessage {
+  return {
+    role: 'system',
+    content:
+      `[本轮工具数达到上限 ${maxPerTurn}，实际收到 ${requested} 个调用，` +
+      `第 ${maxPerTurn + 1} 个及之后的调用未执行。如还需要这些操作，请在下一轮继续。]`,
+  }
+}
 
 export interface GatewayEnv {
   apiKey: string
@@ -519,15 +537,22 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
   // tools tagged with their round) on the non-streaming path.
   const turnRecords: ChatTurnArchive[] = []
   let turns = 0
+  // Cumulative tool-result回填 budget (P1-2): stop growing `current` once the
+  // total exceeds TOOL_RESULT_CONTEXT_BUDGET so a long tool loop can't explode
+  // the model context.
+  let toolResultBytes = 0
 
   while (turns < maxTurns) {
     if (signal?.aborted) throwAbort()
     turns += 1
+    // Last round: tools are withheld so the model MUST answer in words — it
+    // can't end the conversation with a tool call.
+    const roundTools = turns >= maxTurns ? [] : tools
     const { content, reasoning, toolCalls } = await singleCall(
       context,
       conversationId,
       current,
-      tools,
+      roundTools,
       signal,
       temperature,
       maxTokens,
@@ -539,7 +564,10 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
     if (reasoning.trim()) reasoningParts.push(reasoning.trim())
 
     // No tool work left, or no runner to do it: return the final assistant text.
-    if (toolCalls.length === 0 || !toolRunner) {
+    // On the final round tools are withheld (roundTools === []), so even if the
+    // model (or a stub) still returns tool_calls, they are IGNORED — the turn
+    // must end in words.
+    if (toolCalls.length === 0 || !toolRunner || turns >= maxTurns) {
       const reasoningAll = reasoningParts.join('')
       turnRecords.push({
         turn: turns,
@@ -551,14 +579,23 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
         return { text: content, turns, toolResults, reasoning: reasoningAll, turnRecords }
       }
       // Natural end: the accumulated spoken text, or '' when the model produced
-      // nothing at all (the chat endpoint maps '' to '（没有回复）').
+      // nothing at all (the chat endpoint maps '' to '（模型没有输出正文）').
       return { text: parts.join(''), turns, toolResults, reasoning: reasoningAll, turnRecords }
     }
 
-    const assistantMessage: LlmMessage = { role: 'assistant', content, tool_calls: toolCalls }
+    // Per-round cap (P1-1): the assistant message and the execution loop share
+    // the SAME truncated array, so a round that requests more than
+    // MAX_TOOLS_PER_TURN tools never leaves dangling `tool_calls` on the wire —
+    // every id the next request sees has a matching role:'tool' result.
+    const callsToRun = toolCalls.slice(0, MAX_TOOLS_PER_TURN)
+    const assistantMessage: LlmMessage = { role: 'assistant', content, tool_calls: callsToRun }
     current.push(assistantMessage)
     const roundResults: ToolRunRecord[] = []
-    for (const call of toolCalls) {
+    // Cumulative tool-result budget (P1-2): tools still EXECUTE (the real work
+    // happens), but their results stop being回填 into `current` once the budget
+    // is spent, and the turn winds down instead of starting another request.
+    let budgetExceeded = false
+    for (const call of callsToRun) {
       // Abort checkpoint before every tool so the turn budget covers tool
       // execution, not just the LLM fetch (play's 100s controller signal).
       if (signal?.aborted) throwAbort()
@@ -576,12 +613,23 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
       }
       toolResults.push(run)
       roundResults.push(run)
-      current.push({
-        role: 'tool',
-        tool_call_id: call.id,
-        name: call.name,
-        content: text,
-      })
+      if (!budgetExceeded && toolResultBytes + text.length > TOOL_RESULT_CONTEXT_BUDGET) {
+        budgetExceeded = true
+      }
+      if (!budgetExceeded) {
+        toolResultBytes += text.length
+        current.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          name: call.name,
+          content: text,
+        })
+      }
+    }
+    // The 5th+ tool calls were cut this round — tell the model so it knows the
+    // work was NOT done (P2-5). Only when a truncation actually happened.
+    if (toolCalls.length > callsToRun.length) {
+      current.push(truncatedToolsNote(MAX_TOOLS_PER_TURN, toolCalls.length))
     }
     turnRecords.push({
       turn: turns,
@@ -590,18 +638,17 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
       toolResults: roundResults,
     })
 
-    // The maxTurns budget was consumed by this batch of tool calls. The work is
-    // already recorded in toolResults/current, so don't drop it silently — the
-    // final text may be empty because the turn ended on tool calls.
+    // Context budget spent (P1-2): wind down now — this round's prose is the
+    // final reply and no further gateway request is made.
     const reasoningAll = reasoningParts.join('')
-    if (turns >= maxTurns) {
+    if (budgetExceeded) {
       if (!accumulateText) {
         const last = current.filter((message) => message.role === 'assistant').at(-1)
         return { text: textOf(last), turns, toolResults, reasoning: reasoningAll, turnRecords }
       }
       // Accumulated mode keeps every intermediate sentence; a tool-only round
       // with nothing spoken gets the neutral note (same wording as streaming),
-      // never the misleading "（没有回复）".
+      // never a misleading empty reply.
       return { text: parts.join('') || TOOL_ONLY_REPLY_NOTE, turns, toolResults, reasoning: reasoningAll, turnRecords }
     }
   }
