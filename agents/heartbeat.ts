@@ -29,7 +29,7 @@ import {
   type MakersContext,
 } from './_shared.ts'
 import { chatCompletion, type ChatResult } from './_llm.ts'
-import { buildPersona, humanNowText } from './_persona.ts'
+import { buildPersona, humanNowText, readTimeZone } from './_persona.ts'
 import { getState, updateState } from './_state.ts'
 import {
   appendDailyLog,
@@ -139,7 +139,7 @@ export async function runHeartbeat(
   await ensureMemorySafe(context)
   const memory = await readMemorySafe(context)
   const persona = buildPersona({
-    nowText: humanNowText(),
+    nowText: humanNowText(new Date(), readTimeZone()),
     memoryContent: memory ? clampMemoryForContext(memory) : '',
   })
 

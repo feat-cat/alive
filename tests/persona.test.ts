@@ -4,7 +4,7 @@
  */
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildPersona, humanNowText, type PersonaInput } from '../agents/_persona.ts'
+import { buildPersona, humanNowText, readTimeZone, type PersonaInput } from '../agents/_persona.ts'
 
 describe('buildPersona', () => {
   const base: PersonaInput = {
@@ -49,5 +49,60 @@ describe('humanNowText', () => {
   test('pads single-digit month/day/hour/minute', () => {
     const text = humanNowText(new Date(2026, 0, 5, 1, 1)) // 2026-01-05 is a Monday
     assert.equal(text, '2026-01-05 星期一 01:01')
+  })
+
+  test('renders the wall clock in an explicit IANA timezone (Asia/Shanghai)', () => {
+    // 2026-10-01T06:07:00Z == 2026-10-01 14:07 in Asia/Shanghai (UTC+8).
+    const text = humanNowText(new Date('2026-10-01T06:07:00Z'), 'Asia/Shanghai')
+    assert.equal(text, '2026-10-01 星期四 14:07')
+  })
+
+  test('falls back to local time when no timezone is passed', () => {
+    const text = humanNowText(new Date('2026-10-01T06:07:00Z'))
+    assert.match(text, /^\d{4}-\d{2}-\d{2} 星期[日一二三四五六] \d{2}:\d{2}$/)
+    // No timezone argument must never produce a 4-digit-year/timezone artifact —
+    // the shape is identical to the pre-timezone local implementation.
+    assert.equal(text, (() => {
+      const at = new Date('2026-10-01T06:07:00Z')
+      const pad = (n: number) => String(n).padStart(2, '0')
+      const weekdays = ['日', '一', '二', '三', '四', '五', '六']
+      return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())} 星期${weekdays[at.getDay()]} ${pad(at.getHours())}:${pad(at.getMinutes())}`
+    })())
+  })
+
+  test('an invalid IANA timezone falls back to local time without throwing', () => {
+    const text = humanNowText(new Date('2026-10-01T06:07:00Z'), 'Bad/Zone')
+    assert.match(text, /^\d{4}-\d{2}-\d{2} 星期[日一二三四五六] \d{2}:\d{2}$/)
+  })
+
+  test('a whitespace-only timezone behaves like no timezone', () => {
+    const text = humanNowText(new Date('2026-10-01T06:07:00Z'), '   ')
+    assert.match(text, /^\d{4}-\d{2}-\d{2} 星期[日一二三四五六] \d{2}:\d{2}$/)
+  })
+})
+
+describe('readTimeZone', () => {
+  test('returns the trimmed ALIVE_TZ value when set', () => {
+    const previous = process.env.ALIVE_TZ
+    try {
+      process.env.ALIVE_TZ = '  Asia/Shanghai  '
+      assert.equal(readTimeZone(), 'Asia/Shanghai')
+    } finally {
+      if (previous === undefined) delete process.env.ALIVE_TZ
+      else process.env.ALIVE_TZ = previous
+    }
+  })
+
+  test('returns undefined when ALIVE_TZ is unset or whitespace-only', () => {
+    const previous = process.env.ALIVE_TZ
+    try {
+      delete process.env.ALIVE_TZ
+      assert.equal(readTimeZone(), undefined)
+      process.env.ALIVE_TZ = '   '
+      assert.equal(readTimeZone(), undefined)
+    } finally {
+      if (previous === undefined) delete process.env.ALIVE_TZ
+      else process.env.ALIVE_TZ = previous
+    }
   })
 })

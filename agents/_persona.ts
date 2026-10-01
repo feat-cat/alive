@@ -18,8 +18,8 @@ export interface PersonaInput {
 
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'] as const
 
-/** Format a Date as "YYYY-MM-DD 星期X HH:mm" (local wall clock). */
-export function humanNowText(at: Date = new Date()): string {
+/** Fallback: format a Date from its local wall-clock fields. */
+function localNowText(at: Date): string {
   const pad = (n: number) => String(n).padStart(2, '0')
   const year = at.getFullYear()
   const month = pad(at.getMonth() + 1)
@@ -28,6 +28,56 @@ export function humanNowText(at: Date = new Date()): string {
   const hours = pad(at.getHours())
   const minutes = pad(at.getMinutes())
   return `${year}-${month}-${day} 星期${weekday} ${hours}:${minutes}`
+}
+
+/**
+ * Read the optional IANA timezone from `ALIVE_TZ` (e.g. `Asia/Shanghai`). The
+ * value is trimmed; unset / empty / whitespace-only returns `undefined` (the
+ * caller then falls back to the function-local wall clock). Invalid IANA names
+ * are NOT rejected here — `Intl.DateTimeFormat` throws on them and
+ * `humanNowText` catches that and falls back to local time.
+ */
+export function readTimeZone(): string | undefined {
+  const value = process.env.ALIVE_TZ?.trim()
+  return value ? value : undefined
+}
+
+/**
+ * Format a Date as "YYYY-MM-DD 星期X HH:mm". When `timeZone` is a valid IANA
+ * zone, the wall clock is rendered in that zone via `Intl.DateTimeFormat`
+ * (explicit 4-digit year — zh-CN may otherwise emit a 2-digit year); an invalid
+ * zone (or any Intl failure) falls back to the local wall clock, preserving the
+ * pre-timezone behaviour.
+ */
+export function humanNowText(at: Date = new Date(), timeZone?: string): string {
+  if (timeZone && timeZone.trim()) {
+    try {
+      const formatter = new Intl.DateTimeFormat('zh-CN', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        weekday: 'short',
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23',
+      })
+      const parts = new Map(formatter.formatToParts(at).map((part) => [part.type, part.value]))
+      const year = parts.get('year')
+      const month = parts.get('month')
+      const day = parts.get('day')
+      const weekdayRaw = parts.get('weekday')
+      const hours = parts.get('hour')
+      const minutes = parts.get('minute')
+      if (year && month && day && weekdayRaw && hours && minutes) {
+        const weekday = weekdayRaw.replace(/^周/, '')
+        return `${year}-${month}-${day} 星期${weekday} ${hours}:${minutes}`
+      }
+    } catch {
+      // Invalid IANA timezone → fall through to the local wall clock.
+    }
+  }
+  return localNowText(at)
 }
 
 /**

@@ -62,7 +62,7 @@ import {
   type LlmToolCall,
   type ToolRunRecord,
 } from './_llm.ts'
-import { buildPersona, humanNowText } from './_persona.ts'
+import { buildPersona, humanNowText, readTimeZone } from './_persona.ts'
 import {
   appendChatlogRecord,
   clampMemoryForContext,
@@ -124,7 +124,7 @@ export async function runChat(
   // reading MEMORY.md is best-effort so a Blob-less first turn still works.
   const memory = await readMemoryWithSeedSafe(context)
   const persona = buildPersona({
-    nowText: humanNowText(),
+    nowText: humanNowText(new Date(), readTimeZone()),
     memoryContent: memory ? clampMemoryForContext(memory) : '',
   })
 
@@ -283,7 +283,7 @@ async function* chatStreamGenerator(
 
   const memory = await readMemoryWithSeedSafe(context)
   const persona = buildPersona({
-    nowText: humanNowText(),
+    nowText: humanNowText(new Date(), readTimeZone()),
     memoryContent: memory ? clampMemoryForContext(memory) : '',
   })
   const history = await loadMessages(context, conversationId)

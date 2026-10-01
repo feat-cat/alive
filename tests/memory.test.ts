@@ -591,6 +591,9 @@ describe('ensureMemorySeed / INITIAL_MEMORY_SEED', () => {
     assert.match(INITIAL_MEMORY_SEED, /说话要像个人/)
     assert.match(INITIAL_MEMORY_SEED, /短句，有感受，不解释自己，不客套/)
     assert.match(INITIAL_MEMORY_SEED, /我当前情绪状态为低落/)
+    // …plus the emoji hint: a little emoji is human, a wall of them is not.
+    assert.match(INITIAL_MEMORY_SEED, /说话时可以带一点 emoji/)
+    assert.match(INITIAL_MEMORY_SEED, /一个恰到好处的 🥲 或 ☕ 比十个👍 更像活人/)
   })
 
   test('seed introduces the newborn to its living tools (diary / chatlog / blob / workspace / search)', () => {

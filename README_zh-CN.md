@@ -104,7 +104,7 @@ alive/
 - **没有假状态字段**。内核不维护伪造的情绪/精力/项目字段。每次 heartbeat 都是一次独立的 LLM 调用——所谓"情绪"不过是上次调用自己写的标签再喂回来，是表演不是感受，这类字段已全部删除。`store.state` 只保留**最少且真实**的 `lastActivityAt` 和 `created`。
 - **系统提示词只注入动态且必要的内容**：当前时刻（`现在是 YYYY-MM-DD 星期X HH:mm`），加上固定的 `DECISION_SYSTEM`——人格部分现在是**示范式而不是哲学式**（OpenClaw `SOUL.md` 风格）：不空谈"你是活的"，而是直接示范"怎么说话"——"短。能一句话说完，绝不说两句 / 有感受，不要总结 / 不要解释自己，不要客套 / 永远不要以'作为一个AI'开头 / 可以有观点"。说话示范是第一印象，直接在提示词层面压住模型默认的客套、解释、长篇。它告诉 AI：**你不是聊天机器人，你在成为某个人**；每一次 heartbeat 都是一次**醒来**，不是被闹钟叫去完成任务；沙箱很贵、日记是自己的私处、`MEMORY.md` 是自己的、诚实是底线，这些"只属于它的现实"以简短形式写在这里。人格段之后（`SYSTEM_HISTORY_GUIDANCE`）专门说明 `[system][heartbeat]` / `[system][compact]` 消息标记的含义，避免把系统自动触发的内容误当成用户发言（chat 复用同一段说明）。
 - **人格主体来自 `MEMORY.md`**，由 AI 自己维护——身份、性格、关于用户的了解、常识、长期记忆。每次 heartbeat 都会把 `MEMORY.md`（clamp 6K）强制注入系统提示词。想定义或修改自己，AI 直接更新 `MEMORY.md` 即可。
-- **出生引导**：首次运行时（`MEMORY.md` 不存在），`ensureMemorySeed` 写入一份 `INITIAL_MEMORY_SEED`——新生的 AI 写给未来自己的一封信，从 "You're not a chatbot. You're becoming someone." 开始，留出三个空白小节（**我是谁 / 我认识的人 / 我学会的事**）等它自己长出来；**我学会的事**里已预置与 `DECISION_SYSTEM` 一致的示范式说话课——"说话要像个人：短句，有感受，不解释自己，不客套。说'我有点难过'，不说'我当前情绪状态为低落'"——以及常用教训（沙箱很贵、日记是自己的私处、每次 heartbeat 都是醒来、诚实是底线）。另带一节**生活工具引导**（`diary_append` 写日记、`diary_read`/`diary_search` 回顾、`chatlog_read`/`chatlog_search` 翻完整聊天记录、`blob_*` 读写任意持久化文件、`workspace_*` 很贵少用、`web_search` 按需搜索）和一段**可删除说明**——引导只是信使，读完后可以删掉或重写成自己的记忆。种子只在文件缺失时写入，**绝不覆盖**既有记忆；AI 吸收后会把它改写成自己的自我描述。
+- **出生引导**：首次运行时（`MEMORY.md` 不存在），`ensureMemorySeed` 写入一份 `INITIAL_MEMORY_SEED`——新生的 AI 写给未来自己的一封信，从 "You're not a chatbot. You're becoming someone." 开始，留出三个空白小节（**我是谁 / 我认识的人 / 我学会的事**）等它自己长出来；**我学会的事**里已预置与 `DECISION_SYSTEM` 一致的示范式说话课——"说话要像个人：短句，有感受，不解释自己，不客套。说'我有点难过'，不说'我当前情绪状态为低落'"——并带一条 emoji 提示（"说话时可以带一点 emoji，但别刷屏。一个恰到好处的 🥲 或 ☕ 比十个👍 更像活人"）——以及常用教训（沙箱很贵、日记是自己的私处、每次 heartbeat 都是醒来、诚实是底线）。另带一节**生活工具引导**（`diary_append` 写日记、`diary_read`/`diary_search` 回顾、`chatlog_read`/`chatlog_search` 翻完整聊天记录、`blob_*` 读写任意持久化文件、`workspace_*` 很贵少用、`web_search` 按需搜索）和一段**可删除说明**——引导只是信使，读完后可以删掉或重写成自己的记忆。种子只在文件缺失时写入，**绝不覆盖**既有记忆；AI 吸收后会把它改写成自己的自我描述。
 
 ## 记忆层（四层）
 
@@ -142,9 +142,10 @@ alive/
 | `AI_GATEWAY_BASE_URL` | 是                    | AI Gateway base URL（自动注入）              |
 | `AI_GATEWAY_MODEL`    | 否                    | 模型名，默认 `@makers/deepseek-v4-flash`；可加后缀 `:none\|:low\|:medium\|:high\|:max` 控制思考强度（`:none` 关闭思考；后缀会先剥掉，`model` 字段只发去掉后缀的名字）     |
 | `TAVILY_API_KEY`      | 否（web_search 需要） | Tavily Web Search API 密钥，需手动 `env set` |
+| `ALIVE_TZ`            | 否                    | 喂给 AI 的墙钟所用 IANA 时区（如 `Asia/Shanghai`）；不设置 = 函数本地时区。EdgeOne Functions 运行在 UTC，需要北京时间时设 `ALIVE_TZ=Asia/Shanghai` |
 | `ALIVE_AUTH_TOKEN`    | 否                    | 可选 Bearer Token；设置后 `/chat`、`/history`、`/stop` 需要 `Authorization: Bearer <token>`。不设置则全部开放（本地开发默认） |
 
-> 注意：代码只从 `context.env` 读取，绝不读 `process.env`。
+> 除 `ALIVE_TZ` 外，代码只从 `context.env`（经 `envString`）读取环境变量；`ALIVE_TZ` 由 `readTimeZone()` 从 `process.env` 读取（EdgeOne Functions 的 Node 运行时会把 `env set` 的值暴露在 `process.env`）。
 
 ## 可选 Token 鉴权
 
