@@ -64,6 +64,7 @@ import {
 } from './_llm.ts'
 import { buildPersona, humanNowText } from './_persona.ts'
 import {
+  appendChatlogRecord,
   clampMemoryForContext,
   ensureMemorySeed,
   loadMessages,
@@ -157,12 +158,38 @@ export async function runChat(
     hasImages,
   )
 
-  // Persist tool calls into the history before the final assistant reply.
-  await recordToolCalls(context, conversationId, result.toolResults)
+  // Persist the per-round timeline into the chatlog archive. Chat respects the
+  // TRUE event order (思考 → 工具 → 思考 → 工具 → 回答): every intermediate round
+  // archives its own thinking as a chatlog-only assistant record (never the
+  // store), tool records carry the round's `turn`, and the final reply closes
+  // the turn sequence. The store itself stays unchanged — same tool rows + one
+  // final assistant reply as before; turn/reasoning travel only in JSON records.
+  const turnRecords = result.turnRecords
+  const lastTurn = turnRecords.length > 0 ? (turnRecords[turnRecords.length - 1]?.turn ?? 1) : 1
+  for (const record of turnRecords) {
+    const hasContent = record.text.trim().length > 0
+    const hasReasoning = typeof record.reasoning === 'string' && record.reasoning.trim().length > 0
+    // Intermediate rounds: archive the round's thinking/prose with its turn
+    // (chatlog only). The last round is written once below with the full reply.
+    if (record.turn < lastTurn && (hasContent || hasReasoning)) {
+      await archiveChatlogBestEffort(context, {
+        role: 'assistant',
+        content: record.text.trim(),
+        kind: 'assistant',
+        reasoningContent: hasReasoning ? (record.reasoning as string).trim() : undefined,
+        turn: record.turn,
+      })
+    }
+    if (record.toolResults.length > 0) {
+      await recordToolCalls(context, conversationId, record.toolResults, { turn: record.turn })
+    }
+  }
 
+  const lastReasoning = turnRecords.length > 0 ? turnRecords[turnRecords.length - 1]?.reasoning : undefined
   const reply = result.text.trim() || '（没有回复）'
   await persistHistory(context, conversationId, 'assistant', reply, {
-    reasoningContent: result.reasoning,
+    reasoningContent: lastReasoning?.trim() || undefined,
+    turn: lastTurn,
   })
 
   return { reply, conversationId, now: nowIso() }
@@ -358,6 +385,14 @@ async function* streamOneTurn(
  * tool_calls message + `role:'tool'` results are appended, and the next round
  * streams again — so the reply stays `streamed:true` the whole way. The full
  * assistant reply and every tool record are persisted before `[DONE]`.
+ *
+ * Persistence follows the REAL timeline: each round that thought archives its
+ * OWN reasoning as a chatlog-only assistant record (turn = the round) BEFORE its
+ * tool records (which carry the same turn), and the final answer closes the
+ * sequence. Reasoning is split per round — never concatenated into one record —
+ * so `/history` can interleave 思考 → 工具 → 思考 → 工具 → 回答. The context store
+ * is untouched by this refactor: it still receives the same tool rows + the one
+ * final assistant reply; turn/reasoning travel only inside JSON chatlog records.
  */
 async function* streamChatTurn(
   context: MakersContext,
@@ -367,14 +402,10 @@ async function* streamChatTurn(
   signal: AbortSignal | undefined,
 ): AsyncGenerator<string> {
   let current = messages
-  const toolResults: ToolRunRecord[] = []
   // Every round's spoken text is preserved — assistant content is retained even
   // when a round ALSO requests tool calls (standard agent behaviour), so the
   // final reply never loses the intermediate half-sentences.
   const replyParts: string[] = []
-  // All rounds' DeepSeek thinking is concatenated into the one persisted
-  // assistant record (streamed live to the client as reasoning_delta).
-  const reasoningParts: string[] = []
   let exhaustedByTurns = false
 
   for (let turn = 1; turn <= CHAT_MAX_TURNS; turn += 1) {
@@ -384,15 +415,23 @@ async function* streamChatTurn(
     // Accumulate whatever the model said this round. An empty-text round (model
     // only emits tool_calls, no prose) must not affect later rounds.
     if (fullText.trim()) replyParts.push(fullText.trim())
-    if (reasoning.trim()) reasoningParts.push(reasoning.trim())
 
     // No tool work left: this round produced the final answer.
-    if (toolCalls.length === 0) break
+    if (toolCalls.length === 0) {
+      const reply = replyParts.join('') || (exhaustedByTurns ? TOOL_ONLY_REPLY_NOTE : '（没有回复）')
+      await persistHistory(context, conversationId, 'assistant', reply, {
+        reasoningContent: reasoning.trim() || undefined,
+        turn,
+      })
+      yield sseDone()
+      return
+    }
 
     // The model wants to ACT. Record the tool_calls on the assistant message,
     // execute each call (never crashing the turn — a throwing tool becomes an
     // `isError` result), emit progress events, and feed the results back.
     current = [...current, { role: 'assistant', content: fullText, tool_calls: toolCalls }]
+    const roundToolResults: ToolRunRecord[] = []
     for (const call of toolCalls) {
       if (signal?.aborted) throw abortError()
       const args = safeParseArguments(call.arguments)
@@ -402,7 +441,7 @@ async function* streamChatTurn(
         isError: true,
       }))
       const modelText = clampText(result.content, MODEL_TOOL_RESULT_MAX)
-      toolResults.push({
+      roundToolResults.push({
         name: call.name,
         args,
         isError: result.isError === true,
@@ -412,26 +451,49 @@ async function* streamChatTurn(
       current = [...current, { role: 'tool', tool_call_id: call.id, name: call.name, content: modelText }]
     }
 
-    // The turn budget was spent on this tool batch: persist what we have.
+    // Archive this round's own thinking/prose (chatlog-only, never the store)
+    // BEFORE its tool records, all tagged with the same turn.
+    if (fullText.trim() || reasoning.trim()) {
+      await archiveChatlogBestEffort(context, {
+        role: 'assistant',
+        content: fullText.trim(),
+        kind: 'assistant',
+        reasoningContent: reasoning.trim() || undefined,
+        turn,
+      })
+    }
+    if (roundToolResults.length > 0) {
+      await recordToolCalls(context, conversationId, roundToolResults, { turn })
+    }
+
+    // The turn budget was spent on this tool batch: close the turn sequence.
     if (turn >= CHAT_MAX_TURNS) {
       exhaustedByTurns = true
-      break
+      // Reply: budget exhausted with nothing spoken → a neutral note (the tool
+      // records already told the story), never the misleading "（没有回复）".
+      const reply = replyParts.join('') || TOOL_ONLY_REPLY_NOTE
+      await persistHistory(context, conversationId, 'assistant', reply, { turn })
+      yield sseDone()
+      return
     }
   }
 
-  // Reply: natural end → the accumulated text; budget exhausted with nothing
-  // spoken → a neutral note (the tool records already told the story), so we
-  // never fall back to the misleading "（没有回复）" after a tool-only turn.
-  const reply =
-    replyParts.join('') ||
-    (exhaustedByTurns ? TOOL_ONLY_REPLY_NOTE : '（没有回复）')
-
-  // Tool records go into history BEFORE the final assistant reply.
-  await recordToolCalls(context, conversationId, toolResults)
-  await persistHistory(context, conversationId, 'assistant', reply, {
-    reasoningContent: reasoningParts.join(''),
-  })
+  // Unreachable in practice (an answer round returns above); kept for TS.
+  const reply = replyParts.join('') || '（没有回复）'
+  await persistHistory(context, conversationId, 'assistant', reply, { turn: CHAT_MAX_TURNS })
   yield sseDone()
+}
+
+/** Best-effort chatlog-only archive append: a Blob failure degrades silently. */
+async function archiveChatlogBestEffort(
+  context: MakersContext,
+  entry: Parameters<typeof appendChatlogRecord>[1],
+): Promise<void> {
+  try {
+    await appendChatlogRecord(context, entry)
+  } catch {
+    /* best-effort: the store/SSE flow never depends on the archive */
+  }
 }
 
 /** Best-effort MEMORY.md seed + read: Blob unavailable degrades to ''. */

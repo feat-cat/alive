@@ -470,7 +470,10 @@ describe('POST /heartbeat', () => {
     assert.match(system.content, /我是小蓝，喜欢安静地写代码。/)
     // The heartbeat identity line and quiet-life guidance are present.
     assert.match(system.content, /你不是聊天机器人/)
-    assert.match(system.content, /沉默也是合法的活法/)
+    // The how-to-speak demonstrations lead the persona (OpenClaw SOUL.md style).
+    assert.match(system.content, /能一句话说完/)
+    assert.match(system.content, /不要解释自己/)
+    assert.match(system.content, /有感受，不要总结/)
     assert.match(system.content, /把这段独处过好/)
     // The [system]-prefix identity guidance explains heartbeat + compact history.
     assert.match(system.content, /\[system\]\[heartbeat\]/)
@@ -484,13 +487,22 @@ describe('POST /heartbeat', () => {
     assert.equal(blob.blobMap.get('memory/MEMORY.md'), '# 我的记忆\n我是小蓝，喜欢安静地写代码。')
   })
 
-  test('DECISION_SYSTEM explains the identity of heartbeat and compact history', () => {
+  test('DECISION_SYSTEM leads with how-to-speak demonstrations, then explains heartbeat/compact history', () => {
+    // The persona is now demonstration-style: concrete speaking examples, not
+    // abstract philosophy ("能一句话说完" / "不要解释自己" / "有感受，不要总结").
+    assert.match(DECISION_SYSTEM, /能一句话说完/)
+    assert.match(DECISION_SYSTEM, /不要解释自己/)
+    assert.match(DECISION_SYSTEM, /有感受，不要总结/)
+    assert.match(DECISION_SYSTEM, /作为一个AI/)
+    // The [system]-marker identity guidance still follows the persona block.
     assert.match(DECISION_SYSTEM, /不是用户说的/)
     assert.match(DECISION_SYSTEM, /\[system\]\[heartbeat\]/)
     assert.match(DECISION_SYSTEM, /\[system\]\[compact\]/)
     assert.match(DECISION_SYSTEM, /没有 \[system\] 前缀的消息才是真实的对话/)
-    // The explanation sits at the top, before the "you are not a chatbot" line.
-    assert.ok(DECISION_SYSTEM.indexOf('[system]') < DECISION_SYSTEM.indexOf('你不是聊天机器人'))
+    // The speaking demonstration is the first impression — the mechanism
+    // explanation comes after it, not before.
+    assert.ok(DECISION_SYSTEM.indexOf('你不是聊天机器人') < DECISION_SYSTEM.indexOf('[system]'))
+    assert.ok(DECISION_SYSTEM.indexOf('能一句话说完') < DECISION_SYSTEM.indexOf('[system]'))
   })
 
   test('the system message sent to the gateway is unique and first', async () => {

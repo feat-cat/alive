@@ -243,7 +243,7 @@ describe('POST /chat', () => {
     assert.equal(assistantRecord?.reasoningContent, '先思考')
   })
 
-  test('streaming path: reasoning survives tool rounds by concatenating all rounds into the assistant record', async () => {
+  test('streaming path: reasoning is archived per-round with turn, not concatenated into one record', async () => {
     const store = makeMockStore()
     const blob = makeMockBlobStore()
     injectBlobStoreForTesting(blob)
@@ -279,13 +279,29 @@ describe('POST /chat', () => {
     assert.equal(res.status, 200)
     await res.text()
     assert.equal(fetchCalls, 2)
-    const assistantRecord = (blob.blobMap.get(`chatlog/${dateKey(new Date())}.jsonl`) ?? '')
+
+    const assistantRecords = (blob.blobMap.get(`chatlog/${dateKey(new Date())}.jsonl`) ?? '')
       .split('\n')
       .filter((line) => line.trim())
-      .map((line) => JSON.parse(line) as { kind: string; content: string; reasoningContent?: string })
-      .find((record) => record.kind === 'assistant')
-    assert.equal(assistantRecord?.content, '好的，查完了。')
-    assert.equal(assistantRecord?.reasoningContent, '第一轮思考第二轮思考')
+      .map((line) => JSON.parse(line) as { kind?: string; content: string; reasoningContent?: string; turn?: number })
+      .filter((record) => record.kind === 'assistant' || record.reasoningContent)
+    assert.equal(assistantRecords.length, 2, 'each round archives its own assistant record')
+    assert.deepEqual(assistantRecords.map((record) => ({ content: record.content, reasoningContent: record.reasoningContent, turn: record.turn })), [
+      { content: '好的，', reasoningContent: '第一轮思考', turn: 1 },
+      { content: '好的，查完了。', reasoningContent: '第二轮思考', turn: 2 },
+    ])
+    // The tool record also carries the round it ran in.
+    const toolRecord = (blob.blobMap.get(`chatlog/${dateKey(new Date())}.jsonl`) ?? '')
+      .split('\n')
+      .filter((line) => line.trim())
+      .map((line) => JSON.parse(line) as { kind?: string; turn?: number })
+      .find((record) => record.kind === 'tool')
+    assert.equal(toolRecord?.turn, 1)
+    // The store still grows only the real tool rows + the one final reply.
+    const toolRows = store.messageLog.filter((row) => row.role === 'assistant' && row.metadata?.kind === 'tool')
+    assert.equal(toolRows.length, 1)
+    assert.equal(store.messageLog.at(-1)?.role, 'assistant')
+    assert.equal(store.messageLog.at(-1)?.content, '好的，查完了。')
   })
 
   test('JSON path (stream:false): assistant reasoning from the gateway is archived into the chatlog JSON record', async () => {
@@ -316,6 +332,64 @@ describe('POST /chat', () => {
       .find((record) => record.kind === 'assistant')
     assert.equal(assistantRecord?.content, '非流式回复')
     assert.equal(assistantRecord?.reasoningContent, '非流式思考')
+  })
+
+  test('JSON path (stream:false): per-round reasoning is archived with turn, not concatenated', async () => {
+    const store = makeMockStore()
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    const toolArgs = JSON.stringify({ query: 'x' })
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      if (fetchCalls === 1) {
+        return new Response(
+          JSON.stringify({
+            choices: [{
+              message: {
+                content: '我查一下。',
+                reasoning_content: '第一轮思考',
+                tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'web_search', arguments: toolArgs } }],
+              },
+            }],
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: '结果是 7。', reasoning_content: '第二轮思考' } }] }),
+        { status: 200 },
+      )
+    })
+
+    const res = await chatOnRequest(makeContext({
+      store,
+      env: gatewayEnv() as Env,
+      body: { message: '帮我算一下', stream: false },
+    }))
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as { ok: boolean; reply: string }
+    assert.equal(body.reply, '我查一下。结果是 7。')
+    assert.equal(fetchCalls, 2)
+
+    const chatlog = (blob.blobMap.get(`chatlog/${dateKey(new Date())}.jsonl`) ?? '')
+      .split('\n')
+      .filter((line) => line.trim())
+      .map((line) => JSON.parse(line) as { kind?: string; content: string; reasoningContent?: string; turn?: number })
+    // Two assistant thinking records: round 1's own thinking + round 2's own
+    // thinking on the final answer — never concatenated into one.
+    const thinking = chatlog.filter((record) => record.kind === 'assistant' && record.reasoningContent)
+    assert.deepEqual(thinking.map((record) => ({ content: record.content, reasoningContent: record.reasoningContent, turn: record.turn })), [
+      { content: '我查一下。', reasoningContent: '第一轮思考', turn: 1 },
+      { content: '我查一下。结果是 7。', reasoningContent: '第二轮思考', turn: 2 },
+    ])
+    const tool = chatlog.find((record) => record.kind === 'tool')
+    assert.equal(tool?.turn, 1)
+    // The store still contains only the real tool row + the one final reply.
+    const toolRows = store.messageLog.filter((row) => row.role === 'assistant' && row.metadata?.kind === 'tool')
+    assert.equal(toolRows.length, 1)
+    assert.equal(store.messageLog.at(-1)?.content, '我查一下。结果是 7。')
+    assert.equal(store.messageLog.at(-1)?.metadata?.reasoningContent, undefined)
   })
 
   test('tool branch: tool_call/tool_result events stream in and the answer continues ai_response streamed:true', async () => {

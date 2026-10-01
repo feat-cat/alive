@@ -240,6 +240,23 @@ export interface ChatOptions {
   accumulateText?: boolean
 }
 
+/**
+ * One round of a chat-completion loop, used by the non-streaming chat path to
+ * archive the TRUE timeline: each round's own thinking + the tools it ran, tagged
+ * with its 1-based `turn`. Reasoning is split per round — never concatenated —
+ * so `/history` and the frontend can interleave 思考 → 工具 → 思考 → 工具 → 回答.
+ */
+export interface ChatTurnArchive {
+  /** 1-based round index within this chat request. */
+  turn: number
+  /** The full text spoken in this round ('' for a prose-less tool round). */
+  text: string
+  /** DeepSeek thinking emitted in this round (absent when none). */
+  reasoning?: string
+  /** Tool results executed in this round (empty when none). */
+  toolResults: ToolRunRecord[]
+}
+
 export interface ChatResult {
   text: string
   turns: number
@@ -247,9 +264,15 @@ export interface ChatResult {
   /**
    * Concatenated `reasoning_content` (DeepSeek thinking) across every round.
    * Optional: absent when the gateway returned no reasoning. heartbeat/compact
-   * ignore it; chat persists it into the JSON chatlog archive only.
+   * ignore it; chat persists the per-round thinking into the JSON chatlog archive.
    */
   reasoning?: string
+  /**
+   * Per-round archive records in execution order. The last entry is the final
+   * answer round; chat uses this to persist thinking per turn (chatlog-only)
+   * plus tool records tagged with their round.
+   */
+  turnRecords: ChatTurnArchive[]
 }
 
 /** Neutral reply for a tool-only turn that exhausts the turn budget (same wording as the streaming chat path). */
@@ -492,6 +515,9 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
   // DeepSeek thinking accumulates across every round so the persisted assistant
   // record can carry the whole reasoning chain (heartbeat/compact ignore it).
   const reasoningParts: string[] = []
+  // Per-round archive records power the chatlog turn timeline (思考 per round,
+  // tools tagged with their round) on the non-streaming path.
+  const turnRecords: ChatTurnArchive[] = []
   let turns = 0
 
   while (turns < maxTurns) {
@@ -515,14 +541,23 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
     // No tool work left, or no runner to do it: return the final assistant text.
     if (toolCalls.length === 0 || !toolRunner) {
       const reasoningAll = reasoningParts.join('')
-      if (!accumulateText) return { text: content, turns, toolResults, reasoning: reasoningAll }
+      turnRecords.push({
+        turn: turns,
+        text: content,
+        reasoning: reasoning.trim() || undefined,
+        toolResults: [],
+      })
+      if (!accumulateText) {
+        return { text: content, turns, toolResults, reasoning: reasoningAll, turnRecords }
+      }
       // Natural end: the accumulated spoken text, or '' when the model produced
       // nothing at all (the chat endpoint maps '' to '（没有回复）').
-      return { text: parts.join(''), turns, toolResults, reasoning: reasoningAll }
+      return { text: parts.join(''), turns, toolResults, reasoning: reasoningAll, turnRecords }
     }
 
     const assistantMessage: LlmMessage = { role: 'assistant', content, tool_calls: toolCalls }
     current.push(assistantMessage)
+    const roundResults: ToolRunRecord[] = []
     for (const call of toolCalls) {
       // Abort checkpoint before every tool so the turn budget covers tool
       // execution, not just the LLM fetch (play's 100s controller signal).
@@ -533,12 +568,14 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
         isError: true,
       }))
       const text = clampForModel(result.content)
-      toolResults.push({
+      const run: ToolRunRecord = {
         name: call.name,
         args,
         isError: result.isError === true,
         content: text,
-      })
+      }
+      toolResults.push(run)
+      roundResults.push(run)
       current.push({
         role: 'tool',
         tool_call_id: call.id,
@@ -546,6 +583,12 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
         content: text,
       })
     }
+    turnRecords.push({
+      turn: turns,
+      text: content,
+      reasoning: reasoning.trim() || undefined,
+      toolResults: roundResults,
+    })
 
     // The maxTurns budget was consumed by this batch of tool calls. The work is
     // already recorded in toolResults/current, so don't drop it silently — the
@@ -554,12 +597,12 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
     if (turns >= maxTurns) {
       if (!accumulateText) {
         const last = current.filter((message) => message.role === 'assistant').at(-1)
-        return { text: textOf(last), turns, toolResults, reasoning: reasoningAll }
+        return { text: textOf(last), turns, toolResults, reasoning: reasoningAll, turnRecords }
       }
       // Accumulated mode keeps every intermediate sentence; a tool-only round
       // with nothing spoken gets the neutral note (same wording as streaming),
       // never the misleading "（没有回复）".
-      return { text: parts.join('') || TOOL_ONLY_REPLY_NOTE, turns, toolResults, reasoning: reasoningAll }
+      return { text: parts.join('') || TOOL_ONLY_REPLY_NOTE, turns, toolResults, reasoning: reasoningAll, turnRecords }
     }
   }
 
@@ -567,9 +610,9 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
   const reasoningAll = reasoningParts.join('')
   if (!accumulateText) {
     const last = current.filter((message) => message.role === 'assistant').at(-1)
-    return { text: textOf(last), turns, toolResults, reasoning: reasoningAll }
+    return { text: textOf(last), turns, toolResults, reasoning: reasoningAll, turnRecords }
   }
-  return { text: parts.join(''), turns, toolResults, reasoning: reasoningAll }
+  return { text: parts.join(''), turns, toolResults, reasoning: reasoningAll, turnRecords }
 }
 
 /** Model-reply text from a message; multimodal array content yields ''. */

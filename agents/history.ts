@@ -22,7 +22,12 @@
  *   limit            max messages to return (default 200, 1-1000)
  *
  * Returns JSON:
- *   `{ ok: true, messages: [{ role, content, kind, ts, reasoningContent? }], ... }`.
+ *   `{ ok: true, messages: [{ role, content, kind, ts, reasoningContent?, turn? }], ... }`.
+ *
+ * The `turn` field (round index within one user request) is preserved
+ * end-to-end so callers can rebuild the true timeline: within one request the
+ * records are already ordered turn-ascending / in-archive-order (archive write
+ * order IS the interleaved 思考 → 工具 → 思考 → 工具 → 回答 sequence).
  */
 import {
   SELF_ID,

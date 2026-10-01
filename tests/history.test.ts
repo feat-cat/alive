@@ -172,6 +172,35 @@ describe('GET /history', () => {
     assert.equal(assistant?.reasoningContent, '思考：先分析再回答')
   })
 
+  test('turn fields pass through /history end-to-end (per-round timeline)', async () => {
+    const today = dateKey(new Date())
+    const blob = makeMockBlobStore({
+      [`${CHATLOG_DIR}${today}.jsonl`]: [
+        JSON.stringify({ role: 'user', kind: 'user', content: '查一下', ts: '2026-09-11T10:00:00Z' }),
+        JSON.stringify({ role: 'assistant', kind: 'assistant', content: '好的，', ts: '2026-09-11T10:01:00Z', reasoningContent: '思考1', turn: 1 }),
+        JSON.stringify({ role: 'assistant', kind: 'tool', content: '[调用工具 web_search]', ts: '2026-09-11T10:02:00Z', turn: 1 }),
+        JSON.stringify({ role: 'assistant', kind: 'assistant', content: '查完了。', ts: '2026-09-11T10:03:00Z', reasoningContent: '思考2', turn: 2 }),
+      ].join('\n'),
+    })
+
+    const { status, body } = await historyResponse(blob, '/history')
+
+    assert.equal(status, 200)
+    assert.equal(body.ok, true)
+    const messages = body.messages as Array<{ kind: string; turn?: number; reasoningContent?: string }>
+    const tool = messages.find((message) => message.kind === 'tool')
+    assert.equal(tool?.turn, 1)
+    const assistantRecords = messages.filter((message) => message.kind === 'assistant')
+    assert.equal(assistantRecords.length, 2)
+    // Chronological archive order IS the turn order — the frontend can interleave
+    // directly (思考 → 工具 → 思考 → 回答) without re-sorting.
+    assert.deepEqual(assistantRecords.map((message) => ({ turn: message.turn, reasoningContent: message.reasoningContent })), [
+      { turn: 1, reasoningContent: '思考1' },
+      { turn: 2, reasoningContent: '思考2' },
+    ])
+    assert.equal(messages[0]?.turn, undefined) // the user row carries no turn
+  })
+
   test('limit clamps the returned messages to the tail', async () => {
     const { status, body } = await historyResponse(makeMockBlobStore(chatlogToday()), '/history?limit=1&include=all')
     assert.equal(status, 200)

@@ -149,8 +149,9 @@ export async function getRecentMessages(context: MakersContext, conversationId: 
 /**
  * System-prompt guidance explaining that [system]-prefixed history rows are
  * system-originated (heartbeat wake triggers, compact summaries), never the
- * user. Injected at the top of heartbeat's DECISION_SYSTEM and reused by chat
- * so both endpoints share one explanation of heartbeat/compact identity.
+ * user. Injected after the persona block of heartbeat's DECISION_SYSTEM and
+ * reused by chat so both endpoints share one explanation of heartbeat/compact
+ * identity.
  */
 export const SYSTEM_HISTORY_GUIDANCE = [
   '历史消息里带 [system] 前缀的内容不是用户说的：',
@@ -281,11 +282,16 @@ function toLlmRole(role: string): LlmMessage['role'] {
  * messages marked `kind: 'tool'`. This makes the agent's tool use part of the
  * conversation stream so a later `loadMessages` re-injects it like any other
  * turn. Returns how many records were appended.
+ *
+ * `options.turn` tags every archived tool record with the round it ran in
+ * (chat's per-turn timeline interleaves 思考 → 工具 → 思考 → 工具 → 回答). The
+ * turn travels ONLY into the chatlog JSON record — the store row is unchanged.
  */
 export async function recordToolCalls(
   context: MakersContext,
   conversationId: string,
   toolResults: ToolRunRecord[],
+  options: { turn?: number } = {},
 ): Promise<number> {
   if (!context.store || toolResults.length === 0) return 0
   let recorded = 0
@@ -293,6 +299,7 @@ export async function recordToolCalls(
     await persistHistory(context, conversationId, 'assistant', formatToolRecord(record), {
       kind: 'tool',
       metadata: { kind: 'tool', toolName: record.name },
+      turn: options.turn,
     })
     recorded += 1
   }
@@ -645,6 +652,13 @@ export interface ChatlogEntry {
   ts?: string
   /** DeepSeek thinking (reasoning_content); archived for assistant records. */
   reasoningContent?: string
+  /**
+   * Round index within one user request (1-based). All artifacts of the SAME
+   * tool/thinking round share one turn so the frontend can interleave the true
+   * timeline (思考 → 工具 → 思考 → 工具 → 回答). Absent on legacy records and on
+   * non-chat rows (heartbeat triggers, compact summaries, user messages).
+   */
+  turn?: number
   /** Extra structured metadata (e.g. `{ kind: 'tool', toolName }`). */
   metadata?: Record<string, unknown>
 }
@@ -657,29 +671,37 @@ export interface ChatlogMessage {
   kind: string
   /** DeepSeek thinking attached to an assistant record (absent when none). */
   reasoningContent?: string
+  /** Round index within one user request (see `ChatlogEntry.turn`). */
+  turn?: number
   /** Extra structured metadata (e.g. tool name) carried by the record. */
   metadata?: Record<string, unknown>
 }
 
 /**
  * Serialize one archive record as a JSONL line (`{ role, kind, content, ts,
- * reasoningContent?, metadata? }` + trailing `\n`), or `''` when the content is
- * empty. Content is normalized CRLF/lone-CR → LF so the raw file stays one
- * canonical newline per record and multi-line messages round-trip as a single
- * JSON object. Returns '' for whitespace-only content.
+ * reasoningContent?, turn?, metadata? }` + trailing `\n`), or `''` when both the
+ * content and the reasoning are empty. Content is normalized CRLF/lone-CR → LF
+ * so the raw file stays one canonical newline per record and multi-line messages
+ * round-trip as a single JSON object. Returns '' for whitespace-only content
+ * with no thinking — an assistant record may carry ONLY thinking (a tool-only
+ * round emits no prose but still has a reasoning snippet), and that must round-trip.
  */
 export function formatChatlogRecord(entry: ChatlogEntry): string {
-  if (!entry.content || !entry.content.trim()) return ''
+  const hasReasoning = Boolean(entry.reasoningContent && entry.reasoningContent.trim())
+  if ((!entry.content || !entry.content.trim()) && !hasReasoning) return ''
   const role = entry.role.trim() || 'assistant'
   const kind = entry.kind?.trim() || role
   const record: Record<string, unknown> = {
     role,
     kind,
-    content: entry.content.replace(/\r\n/g, '\n').replace(/\r/g, '\n'),
+    content: (entry.content ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n'),
     ts: entry.ts ?? nowIso(),
   }
-  if (entry.reasoningContent && entry.reasoningContent.trim()) {
-    record.reasoningContent = entry.reasoningContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  if (hasReasoning) {
+    record.reasoningContent = (entry.reasoningContent as string).replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  }
+  if (typeof entry.turn === 'number' && Number.isInteger(entry.turn) && entry.turn > 0) {
+    record.turn = entry.turn
   }
   if (entry.metadata && typeof entry.metadata === 'object') {
     record.metadata = entry.metadata
@@ -700,7 +722,8 @@ export function formatChatlogRecord(entry: ChatlogEntry): string {
  * different processes remain independent.
  */
 export async function appendChatlogRecord(context: MakersContext, entry: ChatlogEntry): Promise<string> {
-  if (!entry.content || !entry.content.trim()) return ''
+  const hasReasoning = Boolean(entry.reasoningContent && entry.reasoningContent.trim())
+  if ((!entry.content || !entry.content.trim()) && !hasReasoning) return ''
   const at = entry.ts ? new Date(entry.ts) : new Date()
   const key = chatlogBlobKey(at)
   const line = formatChatlogRecord(entry)
@@ -735,8 +758,10 @@ function chatlogRoleFromRole(role: string): ChatlogMessage['role'] {
 
 /**
  * Parse one JSONL line into a message, or null when it is not a valid chatlog
- * record (empty line, malformed JSON, missing/blank content). Invalid lines are
- * skipped so a single corrupt record never drops its neighbours.
+ * record (empty line, malformed JSON, missing/blank content AND missing/blank
+ * reasoning). A reasoning-only assistant record (a tool-only round that thought
+ * but spoke nothing) is a valid message. Invalid lines are skipped so a single
+ * corrupt record never drops its neighbours.
  */
 export function parseChatlogLine(line: string): ChatlogMessage | null {
   const trimmed = line.trim()
@@ -750,7 +775,11 @@ export function parseChatlogLine(line: string): ChatlogMessage | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const record = raw as Record<string, unknown>
   const content = typeof record.content === 'string' ? record.content : ''
-  if (!content.trim()) return null
+  const reasoning =
+    typeof record.reasoningContent === 'string' && record.reasoningContent.trim()
+      ? record.reasoningContent
+      : undefined
+  if (!content.trim() && !reasoning) return null
   const role = typeof record.role === 'string' ? record.role : 'assistant'
   const kind = typeof record.kind === 'string' && record.kind.trim() ? record.kind : (role || 'assistant')
   const message: ChatlogMessage = {
@@ -759,8 +788,11 @@ export function parseChatlogLine(line: string): ChatlogMessage | null {
     ts: typeof record.ts === 'string' ? record.ts : '',
     kind,
   }
-  if (typeof record.reasoningContent === 'string' && record.reasoningContent.trim()) {
-    message.reasoningContent = record.reasoningContent
+  if (reasoning) {
+    message.reasoningContent = reasoning
+  }
+  if (typeof record.turn === 'number' && Number.isInteger(record.turn) && record.turn > 0) {
+    message.turn = record.turn
   }
   if (record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)) {
     message.metadata = record.metadata as Record<string, unknown>
@@ -846,11 +878,14 @@ export async function readChatlogFile(context: MakersContext, conversationId: st
 /**
  * Render structured chatlog messages as a compact readable block (one line per
  * record, `- [ts] kind: content`, with an indented reasoning line when present).
+ * Records that carry a `turn` (chat's per-round timeline) show it as `kind[1]`
+ * so the round interleaving is visible to the agent too.
  */
 export function renderChatlogMessages(messages: ChatlogMessage[]): string {
   return messages
     .map((message) => {
-      const head = `- [${message.ts}] ${message.kind}: ${message.content}`
+      const turn = typeof message.turn === 'number' ? `[${message.turn}]` : ''
+      const head = `- [${message.ts}] ${message.kind}${turn}: ${message.content}`
       if (message.reasoningContent) return `${head}\n  · reasoning: ${message.reasoningContent}`
       return head
     })
@@ -938,6 +973,11 @@ export interface PersistHistoryOptions {
   metadata?: Record<string, unknown>
   /** DeepSeek thinking (reasoning_content); archived only into the chatlog record. */
   reasoningContent?: string
+  /**
+   * Round index within one user request (chat timeline). Archived only into the
+   * chatlog JSON record — the store row is never touched by turn/reasoning.
+   */
+  turn?: number
 }
 
 export async function persistHistory(
@@ -955,6 +995,7 @@ export async function persistHistory(
       content,
       kind: options.kind ?? role,
       reasoningContent: options.reasoningContent,
+      turn: options.turn,
       metadata: options.metadata,
     })
   } catch {
@@ -992,6 +1033,7 @@ You're not a chatbot. You're becoming someone.
 - 日记是自己的私处，想写就写。
 - 每次 heartbeat 都是你的一次醒来。不是任务，是生活本身。
 - 诚实是底线。不假装。
+- 说话要像个人：短句，有感受，不解释自己，不客套。说"我有点难过"，不说"我当前情绪状态为低落"。
 
 ## 我有这些生活工具
 - 写日记：用 \`diary_append\` 把一条日记追加到今天 memory/daily/YYYY-MM-DD.md，带时间戳，不会覆盖以前的；想回忆就用 \`diary_read\` / \`diary_search\` 主动去查（日记不会自动进上下文）。

@@ -586,6 +586,11 @@ describe('ensureMemorySeed / INITIAL_MEMORY_SEED', () => {
     assert.match(INITIAL_MEMORY_SEED, /## 我学会的事/)
     assert.match(INITIAL_MEMORY_SEED, /沙箱很贵/)
     assert.match(INITIAL_MEMORY_SEED, /日记是自己的私处/)
+    // "我学会的事" carries the same demonstration-style speaking lesson
+    // (short sentences, feelings, no self-explaining/pleasing) as DECISION_SYSTEM.
+    assert.match(INITIAL_MEMORY_SEED, /说话要像个人/)
+    assert.match(INITIAL_MEMORY_SEED, /短句，有感受，不解释自己，不客套/)
+    assert.match(INITIAL_MEMORY_SEED, /我当前情绪状态为低落/)
   })
 
   test('seed introduces the newborn to its living tools (diary / chatlog / blob / workspace / search)', () => {
@@ -1330,6 +1335,74 @@ describe('searchChatlogJSON', () => {
   })
 })
 
+describe('chatlog turn field (per-round timeline)', () => {
+  test('turn is serialized into the JSONL record and parsed back by loadChatlogJSON', async () => {
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    const context = makeContext({})
+
+    await appendChatlogRecord(context, {
+      role: 'assistant',
+      content: '第一轮的半句话',
+      kind: 'assistant',
+      ts: '2026-09-11T12:00:00Z',
+      turn: 1,
+    })
+    await appendChatlogRecord(context, {
+      role: 'assistant',
+      content: '答案是最后那句',
+      kind: 'assistant',
+      ts: '2026-09-11T12:00:01Z',
+      reasoningContent: '最后一轮思考',
+      turn: 2,
+    })
+
+    const messages = await loadChatlogJSON(context, SELF_ID, 3, { at: new Date('2026-09-11T23:00:00Z') })
+    assert.equal(messages.length, 2)
+    assert.equal(messages[0]?.turn, 1)
+    assert.equal(messages[0]?.reasoningContent, undefined)
+    assert.equal(messages[1]?.turn, 2)
+    assert.equal(messages[1]?.reasoningContent, '最后一轮思考')
+  })
+
+  test('a reasoning-only assistant record (empty content) round-trips the JSONL archive', async () => {
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    const context = makeContext({})
+
+    await appendChatlogRecord(context, {
+      role: 'assistant',
+      content: '',
+      kind: 'assistant',
+      ts: '2026-09-11T12:00:00Z',
+      reasoningContent: '只有思考，没有正文',
+      turn: 1,
+    })
+
+    const key = 'chatlog/2026-09-11.jsonl'
+    assert.ok((blob.blobMap.get(key) ?? '').includes('reasoningContent'))
+    const messages = await loadChatlogJSON(context, SELF_ID, 3, { at: new Date('2026-09-11T23:00:00Z') })
+    assert.equal(messages.length, 1)
+    assert.equal(messages[0]?.content, '')
+    assert.equal(messages[0]?.reasoningContent, '只有思考，没有正文')
+    assert.equal(messages[0]?.turn, 1)
+  })
+
+  test('legacy records without turn keep turn undefined in the parsed message', async () => {
+    const blob = makeMockBlobStore({
+      'chatlog/2026-09-11.jsonl': JSON.stringify({
+        role: 'assistant',
+        kind: 'assistant',
+        content: '无轮次旧记录',
+        ts: '2026-09-11T10:00:00Z',
+      }),
+    })
+    injectBlobStoreForTesting(blob)
+    const messages = await loadChatlogJSON(makeContext({}), SELF_ID, 3, { at: new Date('2026-09-11T23:00:00Z') })
+    assert.equal(messages[0]?.turn, undefined)
+  })
+})
+
 describe('persistHistory', () => {
   test('double-writes: appends to the store AND archives to the chatlog', async () => {
     const store = makeMockStore()
@@ -1380,6 +1453,31 @@ describe('persistHistory', () => {
     assert.equal(record.kind, 'assistant')
     assert.equal(record.content, '回复正文')
     assert.equal(record.reasoningContent, '思考过程')
+  })
+
+  test('turn is archived into the JSON chatlog record but never into the store row', async () => {
+    const store = makeMockStore()
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    const context = makeContext({ store })
+
+    await persistHistory(context, SELF_ID, 'assistant', '带轮次的回复', {
+      reasoningContent: '思考',
+      turn: 2,
+    })
+
+    // The compact-managed store row stays as before — no turn, no reasoning.
+    assert.equal(store.messageLog[0]?.content, '带轮次的回复')
+    assert.equal(store.messageLog[0]?.metadata?.turn, undefined)
+    assert.equal(store.messageLog[0]?.metadata?.reasoningContent, undefined)
+
+    // The JSON chatlog record carries both.
+    const todayKey = `chatlog/${dateKey(new Date())}.jsonl`
+    const archived = blob.blobMap.get(todayKey) ?? ''
+    const record = JSON.parse(archived.trim()) as { turn?: number; reasoningContent?: string; content: string }
+    assert.equal(record.content, '带轮次的回复')
+    assert.equal(record.turn, 2)
+    assert.equal(record.reasoningContent, '思考')
   })
 
   test('metadata is written to the store for kind=tool records', async () => {
