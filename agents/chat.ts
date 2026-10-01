@@ -161,7 +161,9 @@ export async function runChat(
   await recordToolCalls(context, conversationId, result.toolResults)
 
   const reply = result.text.trim() || '（没有回复）'
-  await persistHistory(context, conversationId, 'assistant', reply)
+  await persistHistory(context, conversationId, 'assistant', reply, {
+    reasoningContent: result.reasoning,
+  })
 
   return { reply, conversationId, now: nowIso() }
 }
@@ -298,10 +300,13 @@ async function* streamOneTurn(
   messages: LlmMessage[],
   tools: ReturnType<typeof buildTools>,
   signal: AbortSignal | undefined,
-): AsyncGenerator<string, { fullText: string; toolCalls: LlmToolCall[] }> {
+): AsyncGenerator<string, { fullText: string; reasoning: string; toolCalls: LlmToolCall[] }> {
   const buffer = new DeltaBuffer()
   let streamError: unknown = null
   let toolCalls: LlmToolCall[] = []
+  // DeepSeek thinking accumulates locally so the turn can persist it later —
+  // reasoning still streams live to the client as reasoning_delta events.
+  let reasoningText = ''
   const streamTask = (async () => {
     try {
       await streamChatCompletion({
@@ -313,7 +318,10 @@ async function* streamOneTurn(
         temperature: CHAT_TEMPERATURE,
         maxTokens: CHAT_MAX_TOKENS,
         onDelta: (delta) => buffer.push({ kind: 'content', text: delta }),
-        onReasoning: (reasoning) => buffer.push({ kind: 'reasoning', text: reasoning }),
+        onReasoning: (reasoning) => {
+          reasoningText += reasoning
+          buffer.push({ kind: 'reasoning', text: reasoning })
+        },
         onToolCalls: (calls) => {
           toolCalls = calls
         },
@@ -331,7 +339,7 @@ async function* streamOneTurn(
     if (frame.done) break
     if (frame.value.kind === 'reasoning') {
       // DeepSeek thinking: a separate event the frontend can fold/show above
-      // the answer bubble. Reasoning is never persisted.
+      // the answer bubble. The reasoning also accumulates for the archive.
       yield sseEvent({ type: 'reasoning_delta', content: frame.value.text })
     } else {
       fullText += frame.value.text
@@ -340,7 +348,7 @@ async function* streamOneTurn(
   }
   await streamTask
   if (streamError) throw streamError
-  return { fullText, toolCalls }
+  return { fullText, reasoning: reasoningText, toolCalls }
 }
 
 /**
@@ -364,15 +372,19 @@ async function* streamChatTurn(
   // when a round ALSO requests tool calls (standard agent behaviour), so the
   // final reply never loses the intermediate half-sentences.
   const replyParts: string[] = []
+  // All rounds' DeepSeek thinking is concatenated into the one persisted
+  // assistant record (streamed live to the client as reasoning_delta).
+  const reasoningParts: string[] = []
   let exhaustedByTurns = false
 
   for (let turn = 1; turn <= CHAT_MAX_TURNS; turn += 1) {
     if (signal?.aborted) throw abortError()
-    const { fullText, toolCalls } = yield* streamOneTurn(context, conversationId, current, tools, signal)
+    const { fullText, reasoning, toolCalls } = yield* streamOneTurn(context, conversationId, current, tools, signal)
 
     // Accumulate whatever the model said this round. An empty-text round (model
     // only emits tool_calls, no prose) must not affect later rounds.
     if (fullText.trim()) replyParts.push(fullText.trim())
+    if (reasoning.trim()) reasoningParts.push(reasoning.trim())
 
     // No tool work left: this round produced the final answer.
     if (toolCalls.length === 0) break
@@ -416,7 +428,9 @@ async function* streamChatTurn(
 
   // Tool records go into history BEFORE the final assistant reply.
   await recordToolCalls(context, conversationId, toolResults)
-  await persistHistory(context, conversationId, 'assistant', reply)
+  await persistHistory(context, conversationId, 'assistant', reply, {
+    reasoningContent: reasoningParts.join(''),
+  })
   yield sseDone()
 }
 

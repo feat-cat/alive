@@ -10,11 +10,10 @@ import { afterEach, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mock } from 'node:test'
 import {
-  appendChatlog,
+  appendChatlogRecord,
   appendDailyLog,
   appendMemoryNote,
   CHATLOG_DIR,
-  chatlogBlobKey,
   COMPACT_HIGH_WATER,
   COMPACT_LOW_WATER,
   COMPACT_TRIGGER,
@@ -25,7 +24,7 @@ import {
   getRecentMessages,
   INITIAL_MEMORY_SEED,
   listDailyFiles,
-  loadChatlog,
+  loadChatlogJSON,
   loadFullContext,
   loadMessages,
   maybeCompact,
@@ -35,7 +34,7 @@ import {
   readMemoryFile,
   readRecentDaily,
   recordToolCalls,
-  searchChatlog,
+  searchChatlogJSON,
   searchDaily,
   STORE_MESSAGE_LIMIT,
   toLogEntry,
@@ -961,24 +960,27 @@ describe('recordToolCalls', () => {
   })
 })
 
-describe('appendChatlog / chatlogBlobKey', () => {
-  test('appends timestamped entries to the same chatlog file for the same day', async () => {
+describe('appendChatlogRecord / chatlogBlobKey', () => {
+  test('appends one JSON record per line to the same chatlog file for the same day', async () => {
     const blob = makeMockBlobStore()
     injectBlobStoreForTesting(blob)
     const context = makeContext({})
     const at = new Date('2026-09-11T12:00:00Z')
 
-    const key1 = await appendChatlog(context, SELF_ID, { role: 'user', content: '第一条消息', kind: 'user', ts: at.toISOString() })
-    const key2 = await appendChatlog(context, SELF_ID, { role: 'assistant', content: '第二条消息', kind: 'assistant', ts: at.toISOString() })
+    const key1 = await appendChatlogRecord(context, { role: 'user', content: '第一条消息', kind: 'user', ts: at.toISOString() })
+    const key2 = await appendChatlogRecord(context, { role: 'assistant', content: '第二条消息', kind: 'assistant', ts: at.toISOString() })
 
     assert.equal(key1, key2)
-    assert.equal(key1, 'chatlog/2026-09-11.md')
+    assert.equal(key1, 'chatlog/2026-09-11.jsonl')
     assert.ok(key1.startsWith(CHATLOG_DIR))
     const content = blob.blobMap.get(key1) ?? ''
     assert.ok(content.includes('第一条消息'))
     assert.ok(content.includes('第二条消息'))
     assert.ok(content.indexOf('第一条消息') < content.indexOf('第二条消息'))
-    assert.match(content, /- \[\d{4}-\d{2}-\d{2}T/)
+    // JSONL shape: exactly one parseable JSON object per line.
+    const lines = content.split('\n').filter((line) => line.trim())
+    assert.equal(lines.length, 2)
+    for (const line of lines) assert.doesNotThrow(() => JSON.parse(line))
   })
 
   test('writes different files for different days', async () => {
@@ -986,11 +988,11 @@ describe('appendChatlog / chatlogBlobKey', () => {
     injectBlobStoreForTesting(blob)
     const context = makeContext({})
 
-    await appendChatlog(context, SELF_ID, { role: 'user', content: '周一', kind: 'user', ts: '2026-09-10T12:00:00Z' })
-    await appendChatlog(context, SELF_ID, { role: 'user', content: '周二', kind: 'user', ts: '2026-09-11T12:00:00Z' })
+    await appendChatlogRecord(context, { role: 'user', content: '周一', kind: 'user', ts: '2026-09-10T12:00:00Z' })
+    await appendChatlogRecord(context, { role: 'user', content: '周二', kind: 'user', ts: '2026-09-11T12:00:00Z' })
 
-    assert.ok(blob.blobMap.has('chatlog/2026-09-10.md'))
-    assert.ok(blob.blobMap.has('chatlog/2026-09-11.md'))
+    assert.ok(blob.blobMap.has('chatlog/2026-09-10.jsonl'))
+    assert.ok(blob.blobMap.has('chatlog/2026-09-11.jsonl'))
   })
 
   test('archives tool / heartbeat / summary labels with kind preserved', async () => {
@@ -998,42 +1000,106 @@ describe('appendChatlog / chatlogBlobKey', () => {
     injectBlobStoreForTesting(blob)
     const context = makeContext({})
 
-    await appendChatlog(context, SELF_ID, { role: 'user', content: '（heartbeat 醒来）', kind: 'heartbeat', ts: '2026-09-11T12:00:00Z' })
-    await appendChatlog(context, SELF_ID, { role: 'assistant', content: '早期摘要', kind: 'summary', ts: '2026-09-11T12:01:00Z' })
-    await appendChatlog(context, SELF_ID, { role: 'assistant', content: '[调用工具 web_search]', kind: 'tool', ts: '2026-09-11T12:02:00Z' })
+    await appendChatlogRecord(context, { role: 'user', content: '（heartbeat 醒来）', kind: 'heartbeat', ts: '2026-09-11T12:00:00Z' })
+    await appendChatlogRecord(context, { role: 'assistant', content: '早期摘要', kind: 'summary', ts: '2026-09-11T12:01:00Z' })
+    await appendChatlogRecord(context, { role: 'assistant', content: '[调用工具 web_search]', kind: 'tool', ts: '2026-09-11T12:02:00Z' })
 
-    const content = blob.blobMap.get('chatlog/2026-09-11.md') ?? ''
-    assert.match(content, /heartbeat: （heartbeat 醒来）/)
-    assert.match(content, /summary: 早期摘要/)
-    assert.match(content, /tool: \[调用工具 web_search\]/)
+    const content = blob.blobMap.get('chatlog/2026-09-11.jsonl') ?? ''
+    assert.match(content, /"kind":"heartbeat"/)
+    assert.match(content, /"kind":"summary"/)
+    assert.match(content, /"kind":"tool"/)
+    assert.match(content, /"content":"（heartbeat 醒来）"/)
   })
 
-  test('CRLF content round-trips through append + load without corrupting neighbours (P1-1)', async () => {
+  test('stores assistant reasoningContent inside the JSON record', async () => {
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    const context = makeContext({})
+
+    await appendChatlogRecord(context, {
+      role: 'assistant',
+      content: '答案',
+      kind: 'assistant',
+      ts: '2026-09-11T12:00:00Z',
+      reasoningContent: '先想一下再回答',
+    })
+
+    const content = blob.blobMap.get('chatlog/2026-09-11.jsonl') ?? ''
+    assert.match(content, /"reasoningContent":"先想一下再回答"/)
+  })
+
+  test('serializes concurrent same-day appends so no line is dropped (P1 fix)', async () => {
+    const blob = makeMockBlobStore()
+    // Slow the commit path through a macrotask so an unsynchronized pair of
+    // read-modify-writes CAN lose the first write (both read the empty file,
+    // both commit, the second overwrites the first) — exactly the race between
+    // /chat and the public /heartbeat that per-day serialization must prevent.
+    const baseSet = blob.set
+    blob.set = async (key, value, options) => {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      await baseSet(key, value, options)
+    }
+    injectBlobStoreForTesting(blob)
+    const context = makeContext({})
+
+    const at = new Date('2026-09-11T12:00:00Z')
+    const count = 10
+    await Promise.all(Array.from({ length: count }, (_, index) =>
+      appendChatlogRecord(context, {
+        role: 'user',
+        kind: 'user',
+        content: `并发消息-${index}`,
+        ts: at.toISOString(),
+      })))
+
+    const content = blob.blobMap.get('chatlog/2026-09-11.jsonl') ?? ''
+    const lines = content.split('\n').filter((line) => line.trim())
+    assert.equal(lines.length, count, 'every concurrent append must produce a line')
+    for (let i = 0; i < count; i += 1) {
+      assert.ok(lines.some((line) => line.includes(`并发消息-${i}`)), `并发消息-${i} must survive`)
+    }
+  })
+
+  test('different days stay independent under concurrent appends (P1 fix)', async () => {
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    const context = makeContext({})
+
+    await Promise.all([
+      appendChatlogRecord(context, { role: 'user', kind: 'user', content: '周一', ts: '2026-09-10T12:00:00Z' }),
+      appendChatlogRecord(context, { role: 'user', kind: 'user', content: '周二', ts: '2026-09-11T12:00:00Z' }),
+    ])
+
+    assert.equal((blob.blobMap.get('chatlog/2026-09-10.jsonl') ?? '').split('\n').filter((line) => line.trim()).length, 1)
+    assert.equal((blob.blobMap.get('chatlog/2026-09-11.jsonl') ?? '').split('\n').filter((line) => line.trim()).length, 1)
+  })
+
+  test('CRLF content round-trips through append + load without corrupting neighbours', async () => {
     const blob = makeMockBlobStore()
     injectBlobStoreForTesting(blob)
     const context = makeContext({})
 
     // curl / Windows clients POST message bodies full of \r\n; the writer must
-    // normalize them so the parser (whose `.` never matches \r) still reads the
-    // row back as ONE message instead of silently dropping it.
-    await appendChatlog(context, SELF_ID, {
+    // normalize them to LF so the raw file stays one canonical newline per JSON
+    // record and multi-line content round-trips as ONE message.
+    await appendChatlogRecord(context, {
       role: 'user',
       content: '第一行\r\n第二行\r\n第三行',
       kind: 'user',
       ts: '2026-09-11T12:00:00Z',
     })
-    await appendChatlog(context, SELF_ID, {
+    await appendChatlogRecord(context, {
       role: 'assistant',
       content: '相邻消息',
       kind: 'assistant',
       ts: '2026-09-11T12:01:00Z',
     })
 
-    // The written archive must be canonical LF — no stray \r to trip the regex.
-    const key = 'chatlog/2026-09-11.md'
+    // The written archive must be canonical LF — no stray \r anywhere.
+    const key = 'chatlog/2026-09-11.jsonl'
     assert.ok(!(blob.blobMap.get(key) ?? '').includes('\r'))
 
-    const messages = await loadChatlog(context, SELF_ID, 3, { at: new Date('2026-09-11T23:00:00Z') })
+    const messages = await loadChatlogJSON(context, SELF_ID, 3, { at: new Date('2026-09-11T23:00:00Z') })
 
     // Both messages survive intact and stay separate — no dropped row, no
     // neighbouring-message pollution.
@@ -1052,7 +1118,7 @@ describe('appendChatlog / chatlogBlobKey', () => {
     })
   })
 
-  test('persistHistory archives CRLF content losslessly too (P1-1)', async () => {
+  test('persistHistory archives CRLF content losslessly too', async () => {
     const blob = makeMockBlobStore()
     injectBlobStoreForTesting(blob)
     const store = makeMockStore()
@@ -1062,27 +1128,27 @@ describe('appendChatlog / chatlogBlobKey', () => {
 
     // persistHistory archives with `nowIso()`, so the entry lands in TODAY's
     // file — read with the default `at` to find it.
-    const messages = await loadChatlog(context, SELF_ID, 3)
+    const messages = await loadChatlogJSON(context, SELF_ID, 3)
     assert.equal(messages.length, 1)
     assert.equal(messages[0]?.content, '多行\n内容')
   })
 })
 
-describe('loadChatlog', () => {
-  test('parses archive lines back into role/content/ts/kind messages', async () => {
+describe('loadChatlogJSON', () => {
+  test('parses JSONL records back into role/content/ts/kind messages', async () => {
     const blob = makeMockBlobStore({
-      'chatlog/2026-09-11.md': [
-        '- [2026-09-11T10:00:00Z] user: 你好',
-        '- [2026-09-11T10:01:00Z] assistant: 在的',
-        '- [2026-09-11T10:02:00Z] tool: [调用工具 web_search] 参数={}',
-        '- [2026-09-11T10:03:00Z] heartbeat: （heartbeat 醒来）',
-        '- [2026-09-11T10:04:00Z] summary: 旧摘要',
+      'chatlog/2026-09-11.jsonl': [
+        JSON.stringify({ role: 'user', kind: 'user', content: '你好', ts: '2026-09-11T10:00:00Z' }),
+        JSON.stringify({ role: 'assistant', kind: 'assistant', content: '在的', ts: '2026-09-11T10:01:00Z' }),
+        JSON.stringify({ role: 'assistant', kind: 'tool', content: '[调用工具 web_search] 参数={}', ts: '2026-09-11T10:02:00Z' }),
+        JSON.stringify({ role: 'user', kind: 'heartbeat', content: '（heartbeat 醒来）', ts: '2026-09-11T10:03:00Z' }),
+        JSON.stringify({ role: 'assistant', kind: 'summary', content: '旧摘要', ts: '2026-09-11T10:04:00Z' }),
       ].join('\n'),
     })
     injectBlobStoreForTesting(blob)
     const context = makeContext({})
 
-    const messages = await loadChatlog(context, SELF_ID, 3, { at: new Date('2026-09-11T23:00:00Z') })
+    const messages = await loadChatlogJSON(context, SELF_ID, 3, { at: new Date('2026-09-11T23:00:00Z') })
 
     assert.equal(messages.length, 5)
     assert.deepEqual(messages[0], { role: 'user', content: '你好', ts: '2026-09-11T10:00:00Z', kind: 'user' })
@@ -1095,49 +1161,65 @@ describe('loadChatlog', () => {
     assert.equal(messages[4]?.role, 'assistant')
   })
 
-  test('reads only the most recent N days (chronological order)', async () => {
+  test('returns reasoningContent for assistant records that carry it', async () => {
     const blob = makeMockBlobStore({
-      'chatlog/2026-09-10.md': '- [2026-09-10T10:00:00Z] user: 老早的消息',
-      'chatlog/2026-09-11.md': '- [2026-09-11T10:00:00Z] user: 昨天的消息',
-      'chatlog/2026-09-12.md': '- [2026-09-12T10:00:00Z] user: 今天的消息',
-    })
-    injectBlobStoreForTesting(blob)
-    const context = makeContext({})
-
-    const messages = await loadChatlog(context, SELF_ID, 2, { at: new Date('2026-09-12T12:00:00Z') })
-
-    assert.deepEqual(messages.map((message) => message.content), ['昨天的消息', '今天的消息'])
-  })
-
-  test('parses a raw CRLF archive file via the read-side \\r fallback (P1-1)', async () => {
-    // Files written by older versions or hand-uploaded with Windows line
-    // endings may be CRLF; parseChatlogLines must strip the trailing \r.
-    const blob = makeMockBlobStore({
-      'chatlog/2026-09-11.md': [
-        '- [2026-09-11T10:00:00Z] user: 你好\r',
-        '- [2026-09-11T10:01:00Z] assistant: 在的\r',
+      'chatlog/2026-09-11.jsonl': [
+        JSON.stringify({ role: 'user', kind: 'user', content: '问题', ts: '2026-09-11T10:00:00Z' }),
+        JSON.stringify({ role: 'assistant', kind: 'assistant', content: '回答', ts: '2026-09-11T10:01:00Z', reasoningContent: '思考过程' }),
       ].join('\n'),
     })
     injectBlobStoreForTesting(blob)
     const context = makeContext({})
 
-    const messages = await loadChatlog(context, SELF_ID, 3, { at: new Date('2026-09-11T23:00:00Z') })
+    const messages = await loadChatlogJSON(context, SELF_ID, 3, { at: new Date('2026-09-11T23:00:00Z') })
 
-    assert.equal(messages.length, 2)
-    assert.deepEqual(messages.map((message) => message.content), ['你好', '在的'])
+    assert.equal(messages[1]?.reasoningContent, '思考过程')
+    assert.equal(messages[0]?.reasoningContent, undefined)
   })
 
-  test('keeps the newest messages when the archive exceeds the total clamp', async () => {
-    const big = `- [2026-09-11T10:00:00Z] user: ${'x'.repeat(200_000)}`
+  test('skips malformed lines without dropping neighbours', async () => {
     const blob = makeMockBlobStore({
-      'chatlog/2026-09-10.md': '- [2026-09-10T10:00:00Z] user: 老早的消息',
-      'chatlog/2026-09-11.md': big,
-      'chatlog/2026-09-12.md': '- [2026-09-12T10:00:00Z] user: 最新的消息',
+      'chatlog/2026-09-11.jsonl': [
+        JSON.stringify({ role: 'user', kind: 'user', content: '第一条', ts: '2026-09-11T10:00:00Z' }),
+        'not-json{{{',
+        JSON.stringify({ role: 'assistant', kind: 'assistant', content: '第三条', ts: '2026-09-11T10:01:00Z' }),
+        '',
+      ].join('\n'),
     })
     injectBlobStoreForTesting(blob)
     const context = makeContext({})
 
-    const messages = await loadChatlog(context, SELF_ID, 3, { at: new Date('2026-09-12T12:00:00Z') })
+    const messages = await loadChatlogJSON(context, SELF_ID, 3, { at: new Date('2026-09-11T23:00:00Z') })
+
+    assert.equal(messages.length, 2)
+    assert.deepEqual(messages.map((message) => message.content), ['第一条', '第三条'])
+  })
+
+  test('reads only the most recent N days (chronological order)', async () => {
+    const blob = makeMockBlobStore({
+      'chatlog/2026-09-10.jsonl': `${JSON.stringify({ role: 'user', kind: 'user', content: '老早的消息', ts: '2026-09-10T10:00:00Z' })}\n`,
+      'chatlog/2026-09-11.jsonl': `${JSON.stringify({ role: 'user', kind: 'user', content: '昨天的消息', ts: '2026-09-11T10:00:00Z' })}\n`,
+      'chatlog/2026-09-12.jsonl': `${JSON.stringify({ role: 'user', kind: 'user', content: '今天的消息', ts: '2026-09-12T10:00:00Z' })}\n`,
+    })
+    injectBlobStoreForTesting(blob)
+    const context = makeContext({})
+
+    const messages = await loadChatlogJSON(context, SELF_ID, 2, { at: new Date('2026-09-12T12:00:00Z') })
+
+    assert.deepEqual(messages.map((message) => message.content), ['昨天的消息', '今天的消息'])
+  })
+
+  test('keeps the newest messages when the archive exceeds the total clamp', async () => {
+    const big = JSON.stringify({ role: 'user', kind: 'user', content: 'x'.repeat(200_000), ts: '2026-09-11T10:00:00Z' })
+    const blob = makeMockBlobStore({
+      'chatlog/2026-09-10.jsonl': `${JSON.stringify({ role: 'user', kind: 'user', content: '老早的消息', ts: '2026-09-10T10:00:00Z' })}\n`,
+      'chatlog/2026-09-11.jsonl': `${big}\n`,
+      'chatlog/2026-09-12.jsonl': `${JSON.stringify({ role: 'user', kind: 'user', content: '最新的消息', ts: '2026-09-12T10:00:00Z' })}\n`,
+    })
+    injectBlobStoreForTesting(blob)
+    const context = makeContext({})
+
+    const messages = await loadChatlogJSON(context, SELF_ID, 3, { at: new Date('2026-09-12T12:00:00Z') })
 
     // The total clamp keeps the newest tail — the giant old message is dropped
     // before the newest message ever is.
@@ -1147,69 +1229,104 @@ describe('loadChatlog', () => {
 
   test('returns [] when there are no chatlog files or Blob fails', async () => {
     const context = makeContext({})
-    assert.deepEqual(await loadChatlog(context, SELF_ID), [])
+    assert.deepEqual(await loadChatlogJSON(context, SELF_ID), [])
   })
 })
 
 describe('readChatlogFile', () => {
-  test('returns the file content for an existing day and null otherwise', async () => {
-    const blob = makeMockBlobStore({ 'chatlog/2026-09-12.md': '- [2026-09-12T10:00:00Z] user: 完整历史' })
+  test('returns structured messages for an existing day and null otherwise', async () => {
+    const blob = makeMockBlobStore({
+      'chatlog/2026-09-12.jsonl': `${JSON.stringify({ role: 'user', kind: 'user', content: '完整历史', ts: '2026-09-12T10:00:00Z' })}\n`,
+    })
     injectBlobStoreForTesting(blob)
     const context = makeContext({})
 
-    assert.equal(await readChatlogFile(context, SELF_ID, '2026-09-12'), '- [2026-09-12T10:00:00Z] user: 完整历史')
+    assert.deepEqual(
+      await readChatlogFile(context, SELF_ID, '2026-09-12'),
+      [{ role: 'user', content: '完整历史', ts: '2026-09-12T10:00:00Z', kind: 'user' }],
+    )
     assert.equal(await readChatlogFile(context, SELF_ID, 'not-a-date'), null)
     assert.equal(await readChatlogFile(context, SELF_ID, '2026-13-01'), null)
     assert.equal(await readChatlogFile(context, SELF_ID, '2026-09-01'), null)
   })
 })
 
-describe('searchChatlog', () => {
-  test('finds matching lines across recent files (case-insensitive, newest first)', async () => {
+describe('searchChatlogJSON', () => {
+  test('finds matching messages across recent files (case-insensitive, newest first)', async () => {
     const blob = makeMockBlobStore({
-      'chatlog/2026-09-11.md': [
-        '- [2026-09-11T10:00:00Z] user: 提到一个 ID 计划',
-        '- [2026-09-11T11:00:00Z] assistant: 天气不错',
+      'chatlog/2026-09-11.jsonl': [
+        JSON.stringify({ role: 'user', kind: 'user', content: '提到一个 ID 计划', ts: '2026-09-11T10:00:00Z' }),
+        JSON.stringify({ role: 'assistant', kind: 'assistant', content: '天气不错', ts: '2026-09-11T11:00:00Z' }),
       ].join('\n'),
-      'chatlog/2026-09-12.md': [
-        '- [2026-09-12T10:00:00Z] user: 还是那个 id 值得做',
-        '- [2026-09-12T11:00:00Z] assistant: 睡觉',
+      'chatlog/2026-09-12.jsonl': [
+        JSON.stringify({ role: 'user', kind: 'user', content: '还是那个 id 值得做', ts: '2026-09-12T10:00:00Z' }),
+        JSON.stringify({ role: 'assistant', kind: 'assistant', content: '睡觉', ts: '2026-09-12T11:00:00Z' }),
       ].join('\n'),
     })
     injectBlobStoreForTesting(blob)
     const context = makeContext({})
 
-    const hits = await searchChatlog(context, SELF_ID, 'ID', 7, { at: new Date('2026-09-12T23:00:00Z') })
+    const hits = await searchChatlogJSON(context, SELF_ID, 'ID', 7, { at: new Date('2026-09-12T23:00:00Z') })
 
     assert.equal(hits.length, 2)
     assert.equal(hits[0]?.day, '2026-09-12')
     assert.equal(hits[1]?.day, '2026-09-11')
-    assert.ok(hits[0]?.snippets.some((snippet) => /id/i.test(snippet)))
-    assert.ok(hits[1]?.snippets.some((snippet) => /id/i.test(snippet)))
+    assert.ok(hits[0]?.messages.some((message) => /id/i.test(message.content)))
+    assert.ok(hits[1]?.messages.some((message) => /id/i.test(message.content)))
   })
 
-  test('returns no hits for an absent or empty keyword', async () => {
-    const blob = makeMockBlobStore({ 'chatlog/2026-09-12.md': '- [2026-09-12T10:00:00Z] user: 平平无奇', })
-    injectBlobStoreForTesting(blob)
-    const context = makeContext({})
-
-    assert.deepEqual(await searchChatlog(context, SELF_ID, '量子', 14), [])
-    assert.deepEqual(await searchChatlog(context, SELF_ID, '   ', 14), [])
-  })
-
-  test('limits the search window to the most recent N days', async () => {
+  test('finds matches inside assistant reasoningContent', async () => {
     const blob = makeMockBlobStore({
-      'chatlog/2026-09-10.md': '- [2026-09-10T10:00:00Z] user: 目标词 老记录',
-      'chatlog/2026-09-11.md': '- [2026-09-11T10:00:00Z] user: 目标词 新记录',
-      'chatlog/2026-09-12.md': '- [2026-09-12T10:00:00Z] user: 目标词 最新记录',
+      'chatlog/2026-09-12.jsonl': [
+        JSON.stringify({ role: 'assistant', kind: 'assistant', content: '表面回复', ts: '2026-09-12T10:00:00Z', reasoningContent: '深层思考中提到了 关键词X' }),
+      ].join('\n'),
     })
     injectBlobStoreForTesting(blob)
     const context = makeContext({})
 
-    const hits = await searchChatlog(context, SELF_ID, '目标词', 1, { at: new Date('2026-09-12T12:00:00Z') })
+    const hits = await searchChatlogJSON(context, SELF_ID, '关键词X', 7, { at: new Date('2026-09-12T23:00:00Z') })
+
+    assert.equal(hits.length, 1)
+    assert.equal(hits[0]?.messages[0]?.reasoningContent, '深层思考中提到了 关键词X')
+  })
+
+  test('returns no hits for an absent or empty keyword', async () => {
+    const blob = makeMockBlobStore({
+      'chatlog/2026-09-12.jsonl': `${JSON.stringify({ role: 'user', kind: 'user', content: '平平无奇', ts: '2026-09-12T10:00:00Z' })}\n`,
+    })
+    injectBlobStoreForTesting(blob)
+    const context = makeContext({})
+
+    assert.deepEqual(await searchChatlogJSON(context, SELF_ID, '量子', 14), [])
+    assert.deepEqual(await searchChatlogJSON(context, SELF_ID, '   ', 14), [])
+  })
+
+  test('limits the search window to the most recent N days', async () => {
+    const blob = makeMockBlobStore({
+      'chatlog/2026-09-10.jsonl': `${JSON.stringify({ role: 'user', kind: 'user', content: '目标词 老记录', ts: '2026-09-10T10:00:00Z' })}\n`,
+      'chatlog/2026-09-11.jsonl': `${JSON.stringify({ role: 'user', kind: 'user', content: '目标词 新记录', ts: '2026-09-11T10:00:00Z' })}\n`,
+      'chatlog/2026-09-12.jsonl': `${JSON.stringify({ role: 'user', kind: 'user', content: '目标词 最新记录', ts: '2026-09-12T10:00:00Z' })}\n`,
+    })
+    injectBlobStoreForTesting(blob)
+    const context = makeContext({})
+
+    const hits = await searchChatlogJSON(context, SELF_ID, '目标词', 1, { at: new Date('2026-09-12T12:00:00Z') })
 
     assert.equal(hits.length, 1)
     assert.equal(hits[0]?.day, '2026-09-12')
+  })
+
+  test('caps matching messages at 3 per file', async () => {
+    const lines = Array.from({ length: 5 }, (_, index) =>
+      JSON.stringify({ role: 'user', kind: 'user', content: `目标词 第${index}条`, ts: `2026-09-12T10:0${index}:00Z` }))
+    const blob = makeMockBlobStore({ 'chatlog/2026-09-12.jsonl': lines.join('\n') })
+    injectBlobStoreForTesting(blob)
+    const context = makeContext({})
+
+    const hits = await searchChatlogJSON(context, SELF_ID, '目标词', 7, { at: new Date('2026-09-12T23:00:00Z') })
+
+    assert.equal(hits.length, 1)
+    assert.equal(hits[0]?.messages.length, 3)
   })
 })
 
@@ -1227,11 +1344,42 @@ describe('persistHistory', () => {
     assert.equal(store.messageLog[0]?.role, 'user')
     assert.equal(store.messageLog[1]?.role, 'assistant')
 
-    const todayKey = `chatlog/${dateKey(new Date())}.md`
+    const todayKey = `chatlog/${dateKey(new Date())}.jsonl`
     const archived = blob.blobMap.get(todayKey) ?? ''
-    assert.match(archived, /user: 你好/)
-    assert.match(archived, /assistant: 在的/)
-    assert.ok(archived.indexOf('你好') < archived.indexOf('在的'))
+    const lines = archived.split('\n').filter((line) => line.trim())
+    assert.equal(lines.length, 2)
+    const first = JSON.parse(lines[0] ?? '{}') as { role: string; kind: string; content: string }
+    const second = JSON.parse(lines[1] ?? '{}') as { role: string; kind: string; content: string }
+    assert.deepEqual(
+      { role: first.role, kind: first.kind, content: first.content },
+      { role: 'user', kind: 'user', content: '你好' },
+    )
+    assert.deepEqual(
+      { role: second.role, kind: second.kind, content: second.content },
+      { role: 'assistant', kind: 'assistant', content: '在的' },
+    )
+  })
+
+  test('archives assistant reasoningContent into the JSON record but never the store row', async () => {
+    const store = makeMockStore()
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    const context = makeContext({ store })
+
+    await persistHistory(context, SELF_ID, 'assistant', '回复正文', { reasoningContent: '思考过程' })
+
+    // The compact-managed store row stays concise — no reasoning field.
+    assert.equal(store.messageLog[0]?.content, '回复正文')
+    assert.equal(store.messageLog[0]?.metadata?.reasoningContent, undefined)
+
+    // The JSON chatlog record carries the thinking.
+    const todayKey = `chatlog/${dateKey(new Date())}.jsonl`
+    const archived = blob.blobMap.get(todayKey) ?? ''
+    const record = JSON.parse(archived.trim()) as { role: string; kind: string; content: string; reasoningContent?: string }
+    assert.equal(record.role, 'assistant')
+    assert.equal(record.kind, 'assistant')
+    assert.equal(record.content, '回复正文')
+    assert.equal(record.reasoningContent, '思考过程')
   })
 
   test('metadata is written to the store for kind=tool records', async () => {
@@ -1245,7 +1393,12 @@ describe('persistHistory', () => {
     const record = store.messageLog[0]
     assert.equal((record?.metadata as { kind?: string; toolName?: string })?.kind, 'tool')
     assert.equal((record?.metadata as { toolName?: string })?.toolName, 'web_search')
-    assert.ok(blob.blobMap.get(`chatlog/${dateKey(new Date())}.md`)?.includes('tool: 调用工具'))
+    const todayKey = `chatlog/${dateKey(new Date())}.jsonl`
+    const archived = blob.blobMap.get(todayKey) ?? ''
+    const parsed = JSON.parse(archived.trim()) as { kind: string; content: string; metadata?: Record<string, unknown> }
+    assert.equal(parsed.kind, 'tool')
+    assert.equal(parsed.content, '调用工具')
+    assert.equal(parsed.metadata?.toolName, 'web_search')
   })
 
   test('metadata is passed through for heartbeat and summary kinds', async () => {
@@ -1262,7 +1415,7 @@ describe('persistHistory', () => {
 
   test('Blob failure degrades without breaking the store write', async () => {
     const store = makeMockStore()
-    // No blob injected → getBlobStore() throws inside appendChatlog.
+    // No blob injected → getBlobStore() throws inside appendChatlogRecord.
     const context = makeContext({ store })
 
     await persistHistory(context, SELF_ID, 'assistant', '即使没有 Blob 也要落店')

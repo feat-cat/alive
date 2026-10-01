@@ -244,6 +244,12 @@ export interface ChatResult {
   text: string
   turns: number
   toolResults: ToolRunRecord[]
+  /**
+   * Concatenated `reasoning_content` (DeepSeek thinking) across every round.
+   * Optional: absent when the gateway returned no reasoning. heartbeat/compact
+   * ignore it; chat persists it into the JSON chatlog archive only.
+   */
+  reasoning?: string
 }
 
 /** Neutral reply for a tool-only turn that exhausts the turn budget (same wording as the streaming chat path). */
@@ -253,6 +259,38 @@ export interface GatewayEnv {
   apiKey: string
   baseUrl: string
   model: string
+  /**
+   * Optional `reasoning_effort` derived from a `:none|:low|:medium|:high|:max`
+   * suffix on `AI_GATEWAY_MODEL`. Absent when no suffix was configured, so the
+   * gateway keeps its default (thinking on).
+   */
+  reasoningEffort?: ReasoningEffort
+}
+
+/** Accepted `AI_GATEWAY_MODEL` suffixes → `reasoning_effort` values. */
+const REASONING_EFFORT_SUFFIXES = ['none', 'low', 'medium', 'high', 'max'] as const
+export type ReasoningEffort = (typeof REASONING_EFFORT_SUFFIXES)[number]
+
+export interface ParsedModel {
+  modelName: string
+  reasoningEffort?: ReasoningEffort
+}
+
+/**
+ * Split an optional `:none|:low|:medium|:high|:max` suffix off a model name
+ * (`AI_GATEWAY_MODEL`). The stripped name is sent as `model` and the suffix is
+ * sent separately as `reasoning_effort` — the gateway accepts `none` (thinking
+ * off), `low/medium/high` and `max` (thinking on / boosted). Unknown suffixes
+ * (e.g. `:abc`) are ignored: the name is returned untouched with no effort, so
+ * an arbitrary model id can never be mangled by a typo.
+ */
+export function parseGatewayModel(raw: string): ParsedModel {
+  const model = raw.trim()
+  const idx = model.lastIndexOf(':')
+  if (idx <= 0) return { modelName: model }
+  const suffix = model.slice(idx + 1)
+  if (!(REASONING_EFFORT_SUFFIXES as readonly string[]).includes(suffix)) return { modelName: model }
+  return { modelName: model.slice(0, idx), reasoningEffort: suffix as ReasoningEffort }
 }
 
 /**
@@ -276,6 +314,9 @@ export function buildChatBody(
     temperature,
     stream,
   }
+  // `model` already carries the suffix-stripped name; the effort travels as its
+  // own top-level parameter (both stream and non-stream share this body).
+  if (gateway.reasoningEffort !== undefined) body.reasoning_effort = gateway.reasoningEffort
   if (tools && tools.length > 0) {
     // OpenAI-compatible gateways require the { type: 'function', function:
     // { name, description, parameters } } wrapper (the flat LlmToolDef registry
@@ -322,14 +363,15 @@ export function requireGatewayEnv(context: MakersContext): GatewayEnv {
   const baseUrl = (env.AI_GATEWAY_BASE_URL ?? '').trim().replace(/\/+$/, '')
   if (!apiKey) throw new Error('Missing environment variable: AI_GATEWAY_API_KEY')
   if (!baseUrl) throw new Error('Missing environment variable: AI_GATEWAY_BASE_URL')
-  const model = (env.AI_GATEWAY_MODEL ?? '').trim() || DEFAULT_MODEL
-  return { apiKey, baseUrl, model }
+  const parsed = parseGatewayModel((env.AI_GATEWAY_MODEL ?? '').trim() || DEFAULT_MODEL)
+  return { apiKey, baseUrl, model: parsed.modelName, reasoningEffort: parsed.reasoningEffort }
 }
 
 interface RawCompletion {
   choices?: Array<{
     message?: {
       content?: string | null
+      reasoning_content?: string | null
       tool_calls?: Array<{
         id?: string
         type?: string
@@ -379,7 +421,7 @@ async function singleCall(
   signal: AbortSignal | undefined,
   temperature: number,
   maxTokens: number | undefined,
-): Promise<{ content: string; toolCalls: LlmToolCall[] }> {
+): Promise<{ content: string; reasoning: string; toolCalls: LlmToolCall[] }> {
   const gateway = requireGatewayEnv(context)
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS)
@@ -406,6 +448,7 @@ async function singleCall(
     const message = payload.choices?.[0]?.message
     return {
       content: message?.content ?? '',
+      reasoning: typeof message?.reasoning_content === 'string' ? message.reasoning_content : '',
       toolCalls: parseToolCalls(message),
     }
   } catch (error) {
@@ -446,12 +489,15 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
   // when `accumulateText` is set, so the JSON path never loses the
   // intermediate half-sentences that precede a tool round.
   const parts: string[] = []
+  // DeepSeek thinking accumulates across every round so the persisted assistant
+  // record can carry the whole reasoning chain (heartbeat/compact ignore it).
+  const reasoningParts: string[] = []
   let turns = 0
 
   while (turns < maxTurns) {
     if (signal?.aborted) throwAbort()
     turns += 1
-    const { content, toolCalls } = await singleCall(
+    const { content, reasoning, toolCalls } = await singleCall(
       context,
       conversationId,
       current,
@@ -464,13 +510,15 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
     // Keep whatever the model said this round. An empty-text round (model only
     // emits tool_calls, no prose) must not affect later rounds.
     if (accumulateText && content.trim()) parts.push(content.trim())
+    if (reasoning.trim()) reasoningParts.push(reasoning.trim())
 
     // No tool work left, or no runner to do it: return the final assistant text.
     if (toolCalls.length === 0 || !toolRunner) {
-      if (!accumulateText) return { text: content, turns, toolResults }
+      const reasoningAll = reasoningParts.join('')
+      if (!accumulateText) return { text: content, turns, toolResults, reasoning: reasoningAll }
       // Natural end: the accumulated spoken text, or '' when the model produced
       // nothing at all (the chat endpoint maps '' to '（没有回复）').
-      return { text: parts.join(''), turns, toolResults }
+      return { text: parts.join(''), turns, toolResults, reasoning: reasoningAll }
     }
 
     const assistantMessage: LlmMessage = { role: 'assistant', content, tool_calls: toolCalls }
@@ -502,24 +550,26 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
     // The maxTurns budget was consumed by this batch of tool calls. The work is
     // already recorded in toolResults/current, so don't drop it silently — the
     // final text may be empty because the turn ended on tool calls.
+    const reasoningAll = reasoningParts.join('')
     if (turns >= maxTurns) {
       if (!accumulateText) {
         const last = current.filter((message) => message.role === 'assistant').at(-1)
-        return { text: textOf(last), turns, toolResults }
+        return { text: textOf(last), turns, toolResults, reasoning: reasoningAll }
       }
       // Accumulated mode keeps every intermediate sentence; a tool-only round
       // with nothing spoken gets the neutral note (same wording as streaming),
       // never the misleading "（没有回复）".
-      return { text: parts.join('') || TOOL_ONLY_REPLY_NOTE, turns, toolResults }
+      return { text: parts.join('') || TOOL_ONLY_REPLY_NOTE, turns, toolResults, reasoning: reasoningAll }
     }
   }
 
   // Unreachable when maxTurns >= 1 (the loop always returns), kept for TS.
+  const reasoningAll = reasoningParts.join('')
   if (!accumulateText) {
     const last = current.filter((message) => message.role === 'assistant').at(-1)
-    return { text: textOf(last), turns, toolResults }
+    return { text: textOf(last), turns, toolResults, reasoning: reasoningAll }
   }
-  return { text: parts.join(''), turns, toolResults }
+  return { text: parts.join(''), turns, toolResults, reasoning: reasoningAll }
 }
 
 /** Model-reply text from a message; multimodal array content yields ''. */

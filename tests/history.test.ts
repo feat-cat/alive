@@ -23,16 +23,16 @@ import {
   type MockBlobStore,
 } from './_helpers.ts'
 
-/** A realistic day's chatlog with all kinds present. */
+/** A realistic day's chatlog with all kinds present (JSONL, one record per line). */
 function chatlogToday(): Record<string, string> {
   const today = dateKey(new Date())
   return {
-    [`${CHATLOG_DIR}${today}.md`]: [
-      '- [2026-09-11T10:00:00Z] user: 真实用户问题',
-      '- [2026-09-11T10:01:00Z] assistant: 真实回复',
-      '- [2026-09-11T10:02:00Z] tool: [调用工具 web_search] 参数={"query":"x"}',
-      '- [2026-09-11T10:03:00Z] heartbeat: （heartbeat 醒来）此刻想做什么就做什么',
-      '- [2026-09-11T10:04:00Z] summary: 旧的记录摘要',
+    [`${CHATLOG_DIR}${today}.jsonl`]: [
+      JSON.stringify({ role: 'user', kind: 'user', content: '真实用户问题', ts: '2026-09-11T10:00:00Z' }),
+      JSON.stringify({ role: 'assistant', kind: 'assistant', content: '真实回复', ts: '2026-09-11T10:01:00Z', reasoningContent: '思考：先分析再回答' }),
+      JSON.stringify({ role: 'assistant', kind: 'tool', content: '[调用工具 web_search] 参数={"query":"x"}', ts: '2026-09-11T10:02:00Z' }),
+      JSON.stringify({ role: 'user', kind: 'heartbeat', content: '（heartbeat 醒来）此刻想做什么就做什么', ts: '2026-09-11T10:03:00Z' }),
+      JSON.stringify({ role: 'assistant', kind: 'summary', content: '旧的记录摘要', ts: '2026-09-11T10:04:00Z' }),
     ].join('\n'),
   }
 }
@@ -86,13 +86,13 @@ describe('GET /history', () => {
     assert.equal(body.conversationId, 'other-conv')
   })
 
-  test('keyword search returns matching archive lines (heartbeat/summary included)', async () => {
+  test('keyword search returns matching structured messages (heartbeat/summary included)', async () => {
     const today = dateKey(new Date())
     const blob = makeMockBlobStore({
-      [`${CHATLOG_DIR}${today}.md`]: [
-        '- [2026-09-11T10:00:00Z] user: 目标词 出现在用户消息',
-        '- [2026-09-11T10:01:00Z] assistant: 无关回复',
-        '- [2026-09-11T10:02:00Z] summary: 目标词 出现在摘要',
+      [`${CHATLOG_DIR}${today}.jsonl`]: [
+        JSON.stringify({ role: 'user', kind: 'user', content: '目标词 出现在用户消息', ts: '2026-09-11T10:00:00Z' }),
+        JSON.stringify({ role: 'assistant', kind: 'assistant', content: '无关回复', ts: '2026-09-11T10:01:00Z' }),
+        JSON.stringify({ role: 'assistant', kind: 'summary', content: '目标词 出现在摘要', ts: '2026-09-11T10:02:00Z' }),
       ].join('\n'),
     })
 
@@ -111,19 +111,19 @@ describe('GET /history', () => {
     assert.deepEqual(body.messages, [])
   })
 
-  test('keyword search honors limit and slices the tail (P2-1)', async () => {
+  test('keyword search honors limit and keeps the most recent matches (newest-day first)', async () => {
     const today = dateKey(new Date())
     const yesterday = dateKey(new Date(Date.now() - 86_400_000))
-    // searchChatlog caps at 3 snippets per file, so spread the matches across
-    // two days to produce a flattened list longer than the requested limit.
+    // searchChatlogJSON caps at 3 matching messages per file, so spread the
+    // matches across two days to produce a flattened list longer than the limit.
     const blob = makeMockBlobStore({
-      [`${CHATLOG_DIR}${today}.md`]: [
-        '- [2026-09-11T10:00:00Z] user: 目标词 今天一条',
-        '- [2026-09-11T10:01:00Z] assistant: 目标词 今天两条',
+      [`${CHATLOG_DIR}${today}.jsonl`]: [
+        JSON.stringify({ role: 'user', kind: 'user', content: '目标词 今天一条', ts: '2026-09-11T10:00:00Z' }),
+        JSON.stringify({ role: 'assistant', kind: 'assistant', content: '目标词 今天两条', ts: '2026-09-11T10:01:00Z' }),
       ].join('\n'),
-      [`${CHATLOG_DIR}${yesterday}.md`]: [
-        '- [2026-09-10T10:00:00Z] user: 目标词 昨天一条',
-        '- [2026-09-10T10:01:00Z] assistant: 目标词 昨天两条',
+      [`${CHATLOG_DIR}${yesterday}.jsonl`]: [
+        JSON.stringify({ role: 'user', kind: 'user', content: '目标词 昨天一条', ts: '2026-09-10T10:00:00Z' }),
+        JSON.stringify({ role: 'assistant', kind: 'assistant', content: '目标词 昨天两条', ts: '2026-09-10T10:01:00Z' }),
       ].join('\n'),
     })
 
@@ -133,27 +133,43 @@ describe('GET /history', () => {
     assert.equal(body.ok, true)
     const messages = body.messages as Array<{ content: string }>
     assert.equal(messages.length, 2)
-    assert.equal(messages[0]?.content, '目标词 昨天一条')
-    assert.equal(messages[1]?.content, '目标词 昨天两条')
+    // `limit` now takes the HEAD of the newest-day-first flattened hits, so the
+    // most recent matches survive instead of the oldest tail (P2-1 fix).
+    assert.equal(messages[0]?.content, '目标词 今天一条')
+    assert.equal(messages[1]?.content, '目标词 今天两条')
   })
 
-  test('keyword snippets that do not parse are marked kind=search with empty ts (P2-1)', async () => {
+  test('keyword search returns full structured messages including assistant reasoning (P2-1)', async () => {
     const today = dateKey(new Date())
     const blob = makeMockBlobStore({
-      [`${CHATLOG_DIR}${today}.md`]: [
-        '- [2026-09-11T10:00:00Z] user: 目标词 开头',
-        '  续行内容 目标词 也在', // bare continuation line, not a full row
-        '- [2026-09-11T10:01:00Z] assistant: 目标词 结束',
+      [`${CHATLOG_DIR}${today}.jsonl`]: [
+        JSON.stringify({ role: 'user', kind: 'user', content: '目标词 出现在用户消息', ts: '2026-09-11T10:00:00Z' }),
+        JSON.stringify({ role: 'assistant', kind: 'assistant', content: '无关回复', ts: '2026-09-11T10:01:00Z', reasoningContent: '思考中也提到了 目标词' }),
       ].join('\n'),
     })
 
     const { status, body } = await historyResponse(blob, `/history?keyword=${encodeURIComponent('目标词')}`)
 
     assert.equal(status, 200)
-    const messages = body.messages as Array<{ kind: string; ts: string }>
-    const fragment = messages.find((message) => message.kind === 'search')
-    assert.ok(fragment, 'a non-row snippet must surface as kind=search')
-    assert.equal(fragment.ts, '')
+    assert.equal(body.ok, true)
+    const messages = body.messages as Array<{ content: string; kind: string; reasoningContent?: string }>
+    const user = messages.find((message) => message.kind === 'user')
+    assert.ok(user, 'the matching user message is returned whole')
+    assert.equal(user?.content, '目标词 出现在用户消息')
+    // The matched assistant record carries its reasoning end-to-end — no more
+    // line-snippet flattening that could drop the structured fields.
+    const assistant = messages.find((message) => message.kind === 'assistant')
+    assert.equal(assistant?.reasoningContent, '思考中也提到了 目标词')
+  })
+
+  test('assistant reasoningContent is exposed to the frontend for web rendering', async () => {
+    const { status, body } = await historyResponse(makeMockBlobStore(chatlogToday()), '/history')
+
+    assert.equal(status, 200)
+    assert.equal(body.ok, true)
+    const messages = body.messages as Array<{ kind: string; reasoningContent?: string }>
+    const assistant = messages.find((message) => message.kind === 'assistant')
+    assert.equal(assistant?.reasoningContent, '思考：先分析再回答')
   })
 
   test('limit clamps the returned messages to the tail', async () => {
@@ -282,7 +298,7 @@ describe('chatlog tools (registered in buildTools)', () => {
   test('chatlog_read can read the full chatlog key form', async () => {
     const today = dateKey(new Date())
     const tools = buildTools({ context: contextFor(makeMockBlobStore(chatlogToday())), conversationId: SELF_ID })
-    const result = await tools.run('chatlog_read', { day: `${CHATLOG_DIR}${today}.md` })
+    const result = await tools.run('chatlog_read', { day: `${CHATLOG_DIR}${today}.jsonl` })
     assert.equal(result.isError, undefined)
     assert.match(result.content, /真实用户问题/)
   })

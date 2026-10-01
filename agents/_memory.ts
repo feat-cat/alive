@@ -12,19 +12,24 @@
  *  3. Blob `MEMORY.md` = long-term notes the AI writes whenever it wants (no
  *     distillation), bounded: content over MEMORY_LIMIT is moved to
  *     `memory/archive/YYYY-MM-DD.md`.
- *  4. Blob `chatlog/YYYY-MM-DD.md` = the complete, append-only conversation
- *     archive. Every message that touches the context store is ALSO archived
- *     here (via `persistHistory`); compact folds/removes store rows but NEVER
- *     touches the chatlog, so the full original history stays queryable through
- *     GET /history and the chatlog_search / chatlog_read tools. Archive writes
- *     are best-effort: a Blob failure degrades without breaking the main flow.
+ *  4. Blob `chatlog/YYYY-MM-DD.jsonl` = the complete, append-only conversation
+ *     archive in JSONL form (one JSON record per line). Every message that
+ *     touches the context store is ALSO archived here (via `persistHistory`);
+ *     assistant records additionally carry the DeepSeek `reasoning_content`
+ *     thinking (`reasoningContent`), which is archived ONLY into this JSON
+ *     record and never into the compact-managed store row. Compact folds/removes
+ *     store rows but NEVER touches the chatlog, so the full original history
+ *     stays queryable through GET /history and the chatlog_search / chatlog_read
+ *     tools. Archive writes are best-effort: a Blob failure degrades without
+ *     breaking the main flow.
  *
  * Compact degrades gracefully: if the LLM is unavailable it is skipped and the
  * next heartbeat tries again — compaction never crashes the turn.
  *
  * The dual-store rule: context.store feeds the model (compact-managed), Blob
- * chatlog keeps the complete history. Writing both for every message is done by
- * `persistHistory`; reading the archive is `loadChatlog` / `searchChatlog`.
+ * chatlog keeps the complete JSONL history. Writing both for every message is
+ * done by `persistHistory`; reading the archive is `loadChatlogJSON` /
+ * `searchChatlogJSON` (and the chatlog_read / chatlog_search tools).
  */
 import {
   clampText,
@@ -612,111 +617,165 @@ export async function searchDaily(context: MakersContext, keyword: string, days 
 export const CHATLOG_DIR = 'chatlog/'
 /** Total content clamp when loading archive messages (keeps the newest). */
 export const CHATLOG_LOAD_LIMIT = 100_000
-/** Per-day clamp when a chatlog tool reads several days as raw text. */
-const CHATLOG_DAY_RAW_CLAMP = 30_000
 /** Combined clamp for raw multi-day chatlog reads. */
 const CHATLOG_TOTAL_RAW_CLAMP = 120_000
 
 export function chatlogBlobKey(at: Date): string {
-  return `${CHATLOG_DIR}${dateKey(at)}.md`
+  return `${CHATLOG_DIR}${dateKey(at)}.jsonl`
 }
+
+/**
+ * In-process per-day serialization for chatlog appends. A same-calendar-day
+ * append is a non-atomic read-modify-write on `chatlog/YYYY-MM-DD.jsonl`, so
+ * when `/chat` and the public `/heartbeat` write the SAME day file in parallel
+ * the plain path can drop a line (last writer wins). Each day keeps its own
+ * promise tail: appends for one date run strictly in order, and a failed append
+ * is swallowed into the tail so the queue can never get stuck. This closes the
+ * gap inside a single Makers Functions instance; a future Blob-append primitive
+ * (or cross-instance locking) would extend the guarantee across instances.
+ */
+const chatlogAppendQueues = new Map<string, Promise<unknown>>()
 
 export interface ChatlogEntry {
   role: string
   content: string
   /** Archive label — one of user/assistant/tool/heartbeat/summary (default: role). */
   kind?: string
-  /** ISO timestamp; also selects the chatlog/YYYY-MM-DD.md file. */
+  /** ISO timestamp; also selects the chatlog/YYYY-MM-DD.jsonl file. */
   ts?: string
+  /** DeepSeek thinking (reasoning_content); archived for assistant records. */
+  reasoningContent?: string
+  /** Extra structured metadata (e.g. `{ kind: 'tool', toolName }`). */
+  metadata?: Record<string, unknown>
 }
 
-/** Parsed archive message. `role` is the model-facing role derived from `kind`. */
+/** Parsed archive message. `role` is the model-facing role derived from the record. */
 export interface ChatlogMessage {
   role: 'user' | 'assistant'
   content: string
   ts: string
   kind: string
+  /** DeepSeek thinking attached to an assistant record (absent when none). */
+  reasoningContent?: string
+  /** Extra structured metadata (e.g. tool name) carried by the record. */
+  metadata?: Record<string, unknown>
 }
 
-/** Chatlog line prefix: `\n- [ISO] <label>: <content>` (diary-style timestamped). */
-export function formatChatlogEntry(role: string, content: string, ts = nowIso()): string {
-  const line = content.trim()
-  if (!line) return ''
-  const label = role.trim() || 'assistant'
-  // Normalize CRLF / lone CR to LF BEFORE indenting: the parser regex `.` does
-  // not match `\r`, so a CRLF message (curl / Windows clients post these) would
-  // otherwise be written as an unparseable row that silently drops the message
-  // and pollutes its neighbours. One canonical LF format round-trips cleanly.
-  const normalized = line.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-  // Indent embedded newlines so a multi-line message parses back as one entry.
-  return `\n- [${ts}] ${label}: ${normalized.replace(/\n/g, '\n  ')}`
-}
-
-/** Pick the archive label for a message: `kind` wins, else the model role. */
-function chatlogLabel(entry: ChatlogEntry): string {
-  const label = entry.kind?.trim() || entry.role.trim()
-  return label || 'assistant'
+/**
+ * Serialize one archive record as a JSONL line (`{ role, kind, content, ts,
+ * reasoningContent?, metadata? }` + trailing `\n`), or `''` when the content is
+ * empty. Content is normalized CRLF/lone-CR → LF so the raw file stays one
+ * canonical newline per record and multi-line messages round-trip as a single
+ * JSON object. Returns '' for whitespace-only content.
+ */
+export function formatChatlogRecord(entry: ChatlogEntry): string {
+  if (!entry.content || !entry.content.trim()) return ''
+  const role = entry.role.trim() || 'assistant'
+  const kind = entry.kind?.trim() || role
+  const record: Record<string, unknown> = {
+    role,
+    kind,
+    content: entry.content.replace(/\r\n/g, '\n').replace(/\r/g, '\n'),
+    ts: entry.ts ?? nowIso(),
+  }
+  if (entry.reasoningContent && entry.reasoningContent.trim()) {
+    record.reasoningContent = entry.reasoningContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  }
+  if (entry.metadata && typeof entry.metadata === 'object') {
+    record.metadata = entry.metadata
+  }
+  return `${JSON.stringify(record)}\n`
 }
 
 /**
  * Append one message to today's chatlog archive (agent-global key, not
  * per-conversation like the diary). Same calendar day appends to the same file;
- * different days write different files. Returns the blob key. The content is
- * timestamped; events like heartbeat triggers, compact summaries and tool calls
- * are all archived — filtering is a presentation-layer concern.
+ * different days write different files. Returns the blob key. The record is a
+ * single JSON line; events like heartbeat triggers, compact summaries and tool
+ * calls are all archived — filtering is a presentation-layer concern.
+ *
+ * Concurrent appends to the SAME calendar day are serialized per process via
+ * `chatlogAppendQueues`, so an interleaved read-modify-write can never drop a
+ * line (a single day's appends execute strictly in order). Different days and
+ * different processes remain independent.
  */
-export async function appendChatlog(context: MakersContext, conversationId: string, entry: ChatlogEntry): Promise<string> {
+export async function appendChatlogRecord(context: MakersContext, entry: ChatlogEntry): Promise<string> {
   if (!entry.content || !entry.content.trim()) return ''
   const at = entry.ts ? new Date(entry.ts) : new Date()
-  const store = await getBlobStore()
   const key = chatlogBlobKey(at)
-  const line = formatChatlogEntry(chatlogLabel(entry), entry.content, entry.ts ?? nowIso())
+  const line = formatChatlogRecord(entry)
   if (!line) return key
-  const existing = (await store.get(key)) as string | null
-  const content = existing && existing.trim() ? existing + line : line.trimStart()
-  await store.set(key, content)
-  return key
+
+  const day = dateKey(at)
+  const run = async (): Promise<string> => {
+    const store = await getBlobStore()
+    const existing = (await store.get(key)) as string | null
+    const base = existing && existing.length > 0 ? (existing.endsWith('\n') ? existing : `${existing}\n`) : ''
+    await store.set(key, `${base}${line}`)
+    return key
+  }
+  const previous = chatlogAppendQueues.get(day) ?? Promise.resolve()
+  // Chain after the previous same-day append so RMWs stay serial; pass the task
+  // as BOTH handlers so a previous failure never poisons this day's queue.
+  const ran = previous.then(run, run)
+  const tail = ran.catch(() => undefined)
+  chatlogAppendQueues.set(day, tail)
+  // Drop the tail once nothing is chained behind it (only when we are still the
+  // queue head — a newer append replaces the map entry before settling).
+  void tail.then(() => {
+    if (chatlogAppendQueues.get(day) === tail) chatlogAppendQueues.delete(day)
+  })
+  return ran
 }
 
-/** Map an archive label back to a model-facing role (heartbeats stay user). */
-function chatlogRoleFromKind(kind: string): ChatlogMessage['role'] {
-  return kind === 'user' || kind === 'heartbeat' ? 'user' : 'assistant'
+/** Map a stored record role onto the model-facing role union. */
+function chatlogRoleFromRole(role: string): ChatlogMessage['role'] {
+  return role === 'user' ? 'user' : 'assistant'
 }
 
-const CHATLOG_LINE_RE = /^-\s+\[([^\]]+)\]\s+([^\s:]+):(.*)$/
+/**
+ * Parse one JSONL line into a message, or null when it is not a valid chatlog
+ * record (empty line, malformed JSON, missing/blank content). Invalid lines are
+ * skipped so a single corrupt record never drops its neighbours.
+ */
+export function parseChatlogLine(line: string): ChatlogMessage | null {
+  const trimmed = line.trim()
+  if (!trimmed) return null
+  let raw: unknown
+  try {
+    raw = JSON.parse(trimmed)
+  } catch {
+    return null
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const record = raw as Record<string, unknown>
+  const content = typeof record.content === 'string' ? record.content : ''
+  if (!content.trim()) return null
+  const role = typeof record.role === 'string' ? record.role : 'assistant'
+  const kind = typeof record.kind === 'string' && record.kind.trim() ? record.kind : (role || 'assistant')
+  const message: ChatlogMessage = {
+    role: chatlogRoleFromRole(role),
+    content,
+    ts: typeof record.ts === 'string' ? record.ts : '',
+    kind,
+  }
+  if (typeof record.reasoningContent === 'string' && record.reasoningContent.trim()) {
+    message.reasoningContent = record.reasoningContent
+  }
+  if (record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)) {
+    message.metadata = record.metadata as Record<string, unknown>
+  }
+  return message
+}
 
-/** Parse the archive file format into an ordered message list. */
+/** Parse a JSONL archive body into an ordered message list (skips bad lines). */
 function parseChatlogLines(raw: string): ChatlogMessage[] {
   const messages: ChatlogMessage[] = []
-  let current: ChatlogMessage | null = null
   for (const line of raw.split('\n')) {
-    if (!line) continue
-    // Defensive: strip a trailing CR so CRLF archives (curl / Windows clients,
-    // pre-fix writers) still parse even though CHATLOG_LINE_RE's `.` never
-    // matches `\r`. This is the read-side counterpart of formatChatlogEntry.
-    const clean = line.replace(/\r$/, '')
-    const match = CHATLOG_LINE_RE.exec(clean)
-    if (match) {
-      if (current) messages.push(current)
-      const kind = match[2] ?? 'assistant'
-      current = {
-        ts: (match[1] ?? '').trim(),
-        kind,
-        content: (match[3] ?? '').replace(/^\s/, ''),
-        role: chatlogRoleFromKind(kind),
-      }
-    } else if (current && /^\s{2,}/.test(clean)) {
-      // Indented continuation of the previous entry (multi-line content).
-      current.content += `\n${clean.replace(/^\s+/, '')}`
-    }
+    const message = parseChatlogLine(line)
+    if (message) messages.push(message)
   }
-  if (current) messages.push(current)
   return messages
-}
-
-/** Parse a single chatlog line into a message, or null when it is not one. */
-export function parseChatlogLine(line: string): ChatlogMessage | null {
-  return parseChatlogLines(line)[0] ?? null
 }
 
 /** Keep only the newest messages within a total content-char budget. */
@@ -736,12 +795,12 @@ function clampChatlogNewest(messages: ChatlogMessage[], limit: number): ChatlogM
 }
 
 /**
- * Read the last `days` chatlog files into parsed messages (chronological
+ * Read the last `days` chatlog JSONL files into parsed messages (chronological
  * order). The total content is clamped via `CHATLOG_LOAD_LIMIT`, keeping the
  * NEWEST messages; compact never touches these files, so even folded history
  * is still fully readable from the archive. Blob failures degrade to [].
  */
-export async function loadChatlog(
+export async function loadChatlogJSON(
   context: MakersContext,
   conversationId: string,
   days = 30,
@@ -765,22 +824,40 @@ export async function loadChatlog(
   }
 }
 
-/** Read one chatlog archive day (chatlog/YYYY-MM-DD.md), or null. */
-export async function readChatlogFile(context: MakersContext, conversationId: string, day: string): Promise<string | null> {
+/**
+ * Read one chatlog archive day (chatlog/YYYY-MM-DD.jsonl) into structured
+ * messages, or null when the day does not exist / the day is malformed /
+ * Blob fails. Impossible calendar dates are rejected via the `dateFromDay`
+ * round-trip exactly like the diary read path.
+ */
+export async function readChatlogFile(context: MakersContext, conversationId: string, day: string): Promise<ChatlogMessage[] | null> {
   const date = day.trim()
-  // Same unified calendar validation as the diary read path: impossible dates
-  // like "2026-02-31" are rejected via the dateFromDay round-trip.
   if (dateFromDay(date) === null) return null
   try {
     const store = await getBlobStore()
-    const raw = (await store.get(`${CHATLOG_DIR}${date}.md`)) as string | null
-    return typeof raw === 'string' ? raw : null
+    const raw = (await store.get(`${CHATLOG_DIR}${date}.jsonl`)) as string | null
+    if (typeof raw !== 'string' || !raw.trim()) return null
+    return parseChatlogLines(raw)
   } catch {
     return null
   }
 }
 
-/** Read the last `days` chatlog files as raw per-day markdown (newest last). */
+/**
+ * Render structured chatlog messages as a compact readable block (one line per
+ * record, `- [ts] kind: content`, with an indented reasoning line when present).
+ */
+export function renderChatlogMessages(messages: ChatlogMessage[]): string {
+  return messages
+    .map((message) => {
+      const head = `- [${message.ts}] ${message.kind}: ${message.content}`
+      if (message.reasoningContent) return `${head}\n  · reasoning: ${message.reasoningContent}`
+      return head
+    })
+    .join('\n')
+}
+
+/** Read the last `days` chatlog files as readable rendered text (newest last). */
 export async function readRecentChatlog(context: MakersContext, conversationId: string, days = 7, at: Date = new Date()): Promise<string> {
   try {
     const store = await getBlobStore()
@@ -789,7 +866,8 @@ export async function readRecentChatlog(context: MakersContext, conversationId: 
       const date = new Date(at.getTime() - i * 86_400_000)
       const raw = (await store.get(chatlogBlobKey(date))) as string | null
       if (typeof raw === 'string' && raw.trim()) {
-        parts.push(`## ${dateKey(date)}\n${clampText(raw.trim(), CHATLOG_DAY_RAW_CLAMP)}`)
+        const messages = parseChatlogLines(raw)
+        if (messages.length > 0) parts.push(`## ${dateKey(date)}\n${renderChatlogMessages(messages)}`)
       }
     }
     return clampText(parts.join('\n\n'), CHATLOG_TOTAL_RAW_CLAMP)
@@ -801,15 +879,16 @@ export async function readRecentChatlog(context: MakersContext, conversationId: 
 export interface ChatlogSearchHit {
   day: string
   key: string
-  /** Matching archive lines (trimmed, clamped); at most 3 per file. */
-  snippets: string[]
+  /** Matching structured messages (at most 3 per file). */
+  messages: ChatlogMessage[]
 }
 
 /**
- * Case-insensitive keyword search across the most recent `days` chatlog files.
- * Returns per-day hits with their first few matching lines (each clamped).
+ * Case-insensitive keyword search across the most recent `days` chatlog JSONL
+ * files. Searches both `content` and `reasoningContent`, returning per-day hits
+ * with their first few matching structured messages.
  */
-export async function searchChatlog(
+export async function searchChatlogJSON(
   context: MakersContext,
   conversationId: string,
   keyword: string,
@@ -828,13 +907,14 @@ export async function searchChatlog(
       const raw = (await store.get(key)) as string | null
       if (typeof raw !== 'string' || !raw.trim()) continue
       const day = dateKey(date)
-      const snippets: string[] = []
-      for (const line of raw.split('\n')) {
-        if (!line.toLowerCase().includes(needle)) continue
-        snippets.push(clampText(line.trim(), 500))
-        if (snippets.length >= 3) break
+      const messages: ChatlogMessage[] = []
+      for (const message of parseChatlogLines(raw)) {
+        const haystack = [message.content, message.reasoningContent ?? ''].join('\n').toLowerCase()
+        if (!haystack.includes(needle)) continue
+        messages.push(message)
+        if (messages.length >= 3) break
       }
-      if (snippets.length > 0) hits.push({ day, key, snippets })
+      if (messages.length > 0) hits.push({ day, key, messages })
     }
     return hits
   } catch {
@@ -847,12 +927,17 @@ export async function searchChatlog(
  * message to the Blob chatlog (best-effort — an archive failure never breaks
  * the main flow). Used by every history-producing call site so nothing is ever
  * lost from the archive even when compact later folds the store context.
+ * Assistant records may carry `reasoningContent` — the thinking is archived
+ * ONLY into the JSON chatlog record and never into the store row, keeping the
+ * compact-managed context concise.
  */
 export interface PersistHistoryOptions {
   /** Archive label (user/assistant/tool/heartbeat/summary). Defaults to role. */
   kind?: string
   /** Extra store metadata (e.g. `{ kind: 'tool', toolName }`). */
   metadata?: Record<string, unknown>
+  /** DeepSeek thinking (reasoning_content); archived only into the chatlog record. */
+  reasoningContent?: string
 }
 
 export async function persistHistory(
@@ -865,10 +950,12 @@ export async function persistHistory(
   if (!context.store) throw new Error('Store is not available in this context.')
   await context.store.appendMessage({ conversationId, role, content, metadata: options.metadata })
   try {
-    await appendChatlog(context, conversationId, {
+    await appendChatlogRecord(context, {
       role,
       content,
       kind: options.kind ?? role,
+      reasoningContent: options.reasoningContent,
+      metadata: options.metadata,
     })
   } catch {
     /* best-effort: Blob archive failure degrades, the store write stands */

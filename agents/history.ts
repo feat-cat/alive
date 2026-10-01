@@ -1,9 +1,11 @@
 /**
  * GET /history — full conversation archive reader.
  *
- * Reads the append-only Blob chatlog archive (`chatlog/YYYY-MM-DD.md`), which
- * compact NEVER touches: even after the context store folds the oldest 20% into
- * a summary message, the complete original history stays retrievable here.
+ * Reads the append-only Blob chatlog JSONL archive (`chatlog/YYYY-MM-DD.jsonl`,
+ * one JSON record per line), which compact NEVER touches: even after the
+ * context store folds the oldest 20% into a summary message, the complete
+ * original history — including assistant `reasoningContent` thinking — stays
+ * retrievable here.
  *
  * The store is deliberately NOT read — the archive is the source of truth for
  * history, so a missing store degrades to still serving whatever archive exists.
@@ -12,14 +14,15 @@
  *   conversation_id  conversation id (default SELF_ID=eo-self)
  *   days             how many recent calendar days to read (default 30, 1-90)
  *   keyword          optional case-insensitive search over the archive;
- *                    the keyword path returns matching archive LINE SNIPPETS
- *                    (not full parsed messages) and honors `limit` like the
- *                    plain read path
+ *                    the keyword path returns matching STRUCTURED MESSAGES
+ *                    (searching both content and reasoningContent) and honors
+ *                    `limit` like the plain read path (most recent N matches)
  *   include          "all" to include heartbeat triggers + compact summaries
  *                    (default hides kind=heartbeat / kind=summary)
  *   limit            max messages to return (default 200, 1-1000)
  *
- * Returns JSON: `{ ok: true, messages: [{ role, content, kind, ts }], ... }`.
+ * Returns JSON:
+ *   `{ ok: true, messages: [{ role, content, kind, ts, reasoningContent? }], ... }`.
  */
 import {
   SELF_ID,
@@ -31,9 +34,8 @@ import {
   type MakersContext,
 } from './_shared.ts'
 import {
-  loadChatlog,
-  parseChatlogLine,
-  searchChatlog,
+  loadChatlogJSON,
+  searchChatlogJSON,
   type ChatlogMessage,
   type ChatlogSearchHit,
 } from './_memory.ts'
@@ -57,17 +59,20 @@ export async function onRequest(context: any): Promise<Response> {
     let messages: ChatlogMessage[]
     if (keyword) {
       // Keyword search covers the WHOLE archive (including heartbeat/summary);
-      // the user asked for a search, not a filtered reading. Each hit is a
-      // matching archive LINE (snippet semantics), and `limit` applies to the
-      // flattened snippet list exactly like the plain read path.
-      const hits = await searchChatlog(ctx, conversationId, keyword, days)
-      messages = flattenSearchHits(hits).slice(-limit)
+      // the user asked for a search, not a filtered reading. Each hit is a full
+      // structured message whose content/reasoningContent matched, and `limit`
+      // applies to the flattened message list exactly like the plain read path.
+      const hits = await searchChatlogJSON(ctx, conversationId, keyword, days)
+      // `searchChatlogJSON` orders per-day hits newest-day-first, so taking the
+      // HEAD keeps the most recent matches — consistent with the plain read
+      // path and the documented "most recent N" intuition for `limit`.
+      messages = flattenSearchHits(hits).slice(0, limit)
     } else {
       // Full-history read: hide system-generated heartbeat wake prompts and
       // compact summaries by default (they are structural, not conversation);
       // real user messages, assistant replies and tool calls are kept. Pass
       // ?include=all to see everything, then clamp to the requested limit.
-      const loaded = await loadChatlog(ctx, conversationId, days)
+      const loaded = await loadChatlogJSON(ctx, conversationId, days)
       messages = includeAll
         ? loaded
         : loaded.filter((message) => message.kind !== 'heartbeat' && message.kind !== 'summary')
@@ -86,18 +91,14 @@ export async function onRequest(context: any): Promise<Response> {
 }
 
 /**
- * Flatten per-day search hits back into the uniform message shape. Hits are
- * archive LINE SNIPPETS, not full messages: a snippet that parses as a normal
- * chatlog row keeps its real kind/role/ts; one that does not (a continuation
- * line, a `…[truncated]` fragment) is emitted as `kind:'search'` with an empty
- * `ts`, so callers can tell a snippet fragment apart from a real message.
+ * Flatten per-day search hits back into the uniform message shape. Every hit is
+ * already a full structured message (the JSONL archive has no fragment rows),
+ * so this is a straight flatten — reasoningContent is preserved end-to-end.
  */
 function flattenSearchHits(hits: ChatlogSearchHit[]): ChatlogMessage[] {
   const messages: ChatlogMessage[] = []
   for (const hit of hits) {
-    for (const snippet of hit.snippets) {
-      messages.push(parseChatlogLine(snippet) ?? { role: 'assistant', content: snippet, kind: 'search', ts: '' })
-    }
+    messages.push(...hit.messages)
   }
   return messages
 }

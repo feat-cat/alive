@@ -6,7 +6,7 @@
 import { afterEach, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mock } from 'node:test'
-import { buildChatBody, chatCompletion, degradeVisionMessages, isVisionUnsupportedError, streamChatCompletion, stripImageContent, TOOL_ONLY_REPLY_NOTE, withProviderMessageName, type LlmMessage, type LlmToolCall } from '../agents/_llm.ts'
+import { buildChatBody, chatCompletion, degradeVisionMessages, isVisionUnsupportedError, parseGatewayModel, requireGatewayEnv, streamChatCompletion, stripImageContent, TOOL_ONLY_REPLY_NOTE, withProviderMessageName, type LlmMessage, type LlmToolCall } from '../agents/_llm.ts'
 import { gatewayEnv, makeContext } from './_helpers.ts'
 
 afterEach(() => {
@@ -855,6 +855,180 @@ describe('multimodal content (image parts)', () => {
     )
     const sent = (body.messages as Array<{ role: string; content: unknown }>)[0]
     assert.equal(sent?.content, 'hi')
+  })
+})
+
+describe('model reasoning-effort suffix (:none|:low|:medium|:high|:max)', () => {
+  test('parseGatewayModel strips a known suffix and returns the matching effort', () => {
+    assert.deepEqual(parseGatewayModel('@makers/deepseek-v4-flash:none'), {
+      modelName: '@makers/deepseek-v4-flash',
+      reasoningEffort: 'none',
+    })
+    assert.deepEqual(parseGatewayModel('@makers/deepseek-v4-flash:low'), {
+      modelName: '@makers/deepseek-v4-flash',
+      reasoningEffort: 'low',
+    })
+    assert.deepEqual(parseGatewayModel('@makers/deepseek-v4-flash:medium'), {
+      modelName: '@makers/deepseek-v4-flash',
+      reasoningEffort: 'medium',
+    })
+    assert.deepEqual(parseGatewayModel('@makers/deepseek-v4-flash:high'), {
+      modelName: '@makers/deepseek-v4-flash',
+      reasoningEffort: 'high',
+    })
+    assert.deepEqual(parseGatewayModel('@makers/deepseek-v4-flash:max'), {
+      modelName: '@makers/deepseek-v4-flash',
+      reasoningEffort: 'max',
+    })
+  })
+
+  test('parseGatewayModel returns no effort for a bare model and ignores unknown suffixes', () => {
+    const bare = parseGatewayModel('@makers/deepseek-v4-flash')
+    assert.equal(bare.modelName, '@makers/deepseek-v4-flash')
+    assert.equal(bare.reasoningEffort, undefined)
+    const unknown = parseGatewayModel('@makers/deepseek-v4-flash:abc')
+    assert.equal(unknown.modelName, '@makers/deepseek-v4-flash:abc')
+    assert.equal(unknown.reasoningEffort, undefined)
+    const empty = parseGatewayModel('')
+    assert.equal(empty.modelName, '')
+    assert.equal(empty.reasoningEffort, undefined)
+    const ws = parseGatewayModel('   ')
+    assert.equal(ws.modelName, '')
+    assert.equal(ws.reasoningEffort, undefined)
+    // A leading ':' is not a suffix either — the model name must not be emptied.
+    const leading = parseGatewayModel(':none')
+    assert.equal(leading.modelName, ':none')
+    assert.equal(leading.reasoningEffort, undefined)
+  })
+
+  test('requireGatewayEnv strips the suffix into reasoningEffort', () => {
+    const parsed = requireGatewayEnv(makeContext({
+      env: { ...gatewayEnv(), AI_GATEWAY_MODEL: '@makers/deepseek-v4-flash:max' },
+    }))
+    assert.equal(parsed.model, '@makers/deepseek-v4-flash')
+    assert.equal(parsed.reasoningEffort, 'max')
+  })
+
+  test('buildChatBody sends the stripped model plus reasoning_effort for a suffixed gateway', () => {
+    const body = buildChatBody(
+      { apiKey: 'k', baseUrl: 'https://gateway.test', model: '@makers/deepseek-v4-flash', reasoningEffort: 'none' },
+      [{ role: 'user', content: 'hi' }],
+      undefined,
+      0.6,
+      undefined,
+      false,
+    )
+    assert.equal(body.model, '@makers/deepseek-v4-flash')
+    assert.equal(body.reasoning_effort, 'none')
+  })
+
+  test('buildChatBody omits reasoning_effort when no suffix was configured', () => {
+    const body = buildChatBody(
+      { apiKey: 'k', baseUrl: 'https://gateway.test', model: '@makers/deepseek-v4-flash' },
+      [{ role: 'user', content: 'hi' }],
+      undefined,
+      0.6,
+      undefined,
+      false,
+    )
+    assert.equal(body.model, '@makers/deepseek-v4-flash')
+    assert.ok(!('reasoning_effort' in body), 'reasoning_effort must be absent without a suffix')
+  })
+
+  test('chatCompletion sends model without the suffix and reasoning_effort:none when configured', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), { status: 200 })
+    })
+
+    await chatCompletion({
+      context: makeContext({ env: { ...gatewayEnv(), AI_GATEWAY_MODEL: '@makers/deepseek-v4-flash:none' } }),
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      maxTurns: 1,
+    })
+
+    assert.ok(bodies.length >= 1)
+    assert.equal(bodies[0]?.model, '@makers/deepseek-v4-flash')
+    assert.equal(bodies[0]?.reasoning_effort, 'none')
+  })
+
+  test('chatCompletion sends reasoning_effort:max and no suffix in model when configured', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), { status: 200 })
+    })
+
+    await chatCompletion({
+      context: makeContext({ env: { ...gatewayEnv(), AI_GATEWAY_MODEL: '@makers/deepseek-v4-flash:max' } }),
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      maxTurns: 1,
+    })
+
+    assert.ok(bodies.length >= 1)
+    assert.equal(bodies[0]?.model, '@makers/deepseek-v4-flash')
+    assert.equal(bodies[0]?.reasoning_effort, 'max')
+  })
+
+  test('chatCompletion sends no reasoning_effort and the full model when no suffix is configured', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), { status: 200 })
+    })
+
+    await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      maxTurns: 1,
+    })
+
+    assert.ok(bodies.length >= 1)
+    assert.equal(bodies[0]?.model, '@makers/deepseek-v4-flash')
+    assert.ok(!('reasoning_effort' in (bodies[0] ?? {})), 'reasoning_effort must be absent without a suffix')
+  })
+
+  test('chatCompletion ignores an unknown suffix and sends the full model name unchanged', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), { status: 200 })
+    })
+
+    await chatCompletion({
+      context: makeContext({ env: { ...gatewayEnv(), AI_GATEWAY_MODEL: '@makers/deepseek-v4-flash:abc' } }),
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      maxTurns: 1,
+    })
+
+    assert.ok(bodies.length >= 1)
+    assert.equal(bodies[0]?.model, '@makers/deepseek-v4-flash:abc')
+    assert.ok(!('reasoning_effort' in (bodies[0] ?? {})), 'reasoning_effort must be absent for an unknown suffix')
+  })
+
+  test('streaming request carries reasoning_effort:none from a :none suffix', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return sseStreamResponse([sseData({ choices: [{ delta: { content: 'ok' } }] }), 'data: [DONE]\n\n'])
+    })
+
+    await streamChatCompletion({
+      context: makeContext({ env: { ...gatewayEnv(), AI_GATEWAY_MODEL: '@makers/deepseek-v4-flash:none' } }),
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      onDelta: () => {},
+    })
+
+    assert.ok(bodies.length >= 1)
+    assert.equal(bodies[0]?.stream, true)
+    assert.equal(bodies[0]?.model, '@makers/deepseek-v4-flash')
+    assert.equal(bodies[0]?.reasoning_effort, 'none')
   })
 })
 

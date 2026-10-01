@@ -108,7 +108,7 @@ alive/
 
 ## 记忆层（四层）
 
-由 `_memory.ts` 统一维护，核心是**双层存储约定**：`context.store` 负责喂模型（可被 compact 折叠），Blob `chatlog/` 负责保存完整历史（append-only，**永不**被 compact 触碰）。所有产生历史的调用点都走统一入口 `persistHistory(context, conversationId, role, content, kind?)`——既写 store 也归档同一消息（best-effort：Blob 失败降级，不影响主流程）。
+由 `_memory.ts` 统一维护，核心是**双层存储约定**：`context.store` 负责喂模型（可被 compact 折叠），Blob `chatlog/` 负责保存完整历史——以 **JSONL 结构化记录**（append-only，**永不**被 compact 触碰）。所有产生历史的调用点都走统一入口 `persistHistory(context, conversationId, role, content, kind?)`——既写 store 也归档同一消息到 `chatlog/YYYY-MM-DD.jsonl`（best-effort：Blob 失败降级，不影响主流程）。assistant 记录会额外带上模型的 **思考过程**（`reasoning_content` → `reasoningContent` 字段）——只进 JSON 归档记录、**绝不**写进 compact 管理的 store 行，所以模型上下文保持简洁，而完整思考在 `/history` 与 `chatlog_*` 工具里随时可查。
 
 1. **上下文（context.store 消息历史）**：heartbeat 与 chat 共用**同一固定会话**（`SELF_ID=eo-self`）——私下的思考与和用户的对话在**同一份历史**里，是一体的。每次请求（包括 heartbeat）都以**标准 messages 数组**喂给模型：`loadMessages` 按 asc 读取整个 store，把每条消息还原成独立的 `{ role, content }` 条目（compact 的 `summary` 摘要按原样作为消息保留），直接作为 API `messages` 传入——不再拼接 clamp 文本块。工具调用通过 `recordToolCalls` 以 assistant `kind:'tool'` 记录落盘进历史，之后的回合像普通轮次一样重放。消息会无限增长，因此每次 heartbeat 决策前会先跑 **auto-compact**：当 store 占用（条数 / `STORE_MESSAGE_LIMIT=10000`）达到 `COMPACT_TRIGGER=0.6`（区间 0.5~0.75）时，只把**最旧的 20%** 用一次 LLM 调用（`maxTurns:1`）折叠成一条 `summary` 消息，删除旧消息并把摘要追加进消息流（摘要在前、保最新）。LLM 不可用时**降级跳过**，不阻塞 heartbeat；读取失败降级返回 `[]`。
    **消息身份标记。** 系统自动产生的历史会被明确标记，避免模型误认为是真实对话：heartbeat 唤醒触发的消息加载为 `[system][heartbeat] …`（角色仍是 `user`），compact 摘要为 `[system][compact] …`（角色仍是 `assistant`），普通 user/assistant/tool 消息原样不动。系统提示词（`SYSTEM_HISTORY_GUIDANCE`）会说明这些标记——带 `[system]` 前缀的内容不是用户说的，只有不带前缀的消息才是真实对话。
@@ -117,13 +117,22 @@ alive/
 
 3. **长期笔记（Blob `MEMORY.md`）**：AI 的"自我"，想写就写，不做强制蒸馏，从不自动改写。首次由 `ensureMemorySeed` 写入出生引导，之后 AI 自己维护；每次系统提示词强制注入。有界：`appendMemoryNote` 超过 `MEMORY_LIMIT=60KB` 时**保留末尾 60KB**（最新笔记不丢），被截掉的旧内容追加到 `memory/archive/YYYY-MM-DD.md`。
 
-4. **聊天记录归档（Blob `chatlog/YYYY-MM-DD.md`）**：**完整、追加式**的对话历史——凡是写过 store 的消息（heartbeat 触发、AI 回复、工具调用、compact 摘要）都会由 `persistHistory` / `appendChatlog` 一并归档成一行带时间戳的记录。compact 只会折叠/删除 store 里的消息，**绝不触碰**这些文件，所以任何细节都不会丢失。读取方式：
-   - **`GET /history`**——读归档（不是 store），因此即使被 compact 折叠过，完整历史依然可查。参数：`?conversation_id=eo-self`（默认）、`?days=30`（1–90）、`?keyword=…`（大小写不敏感搜索）、`?limit=200`（1–1000）、`?include=all`（包含 heartbeat 触发 + compact 摘要；默认会隐藏 `kind=heartbeat` 与 `kind=summary`，只返回真实对话/回复/工具调用）。返回 `{ ok, messages: [{ role, content, kind, ts }], conversationId, days, count }`。**`keyword` 路径返回的是归档中的命中行片段，而非完整消息**（无法解析成整行的片段标记为 `kind:'search'`、`ts` 为空）；`limit` 对 keyword 路径同样生效。
-   - **`chatlog_search`**——跨归档关键词搜索，返回按天分组的命中片段。
-   - **`chatlog_read`**——读某一天（`chatlog/YYYY-MM-DD.md`）或最近 N 天的完整归档原文。
+4. **聊天记录归档（Blob `chatlog/YYYY-MM-DD.jsonl`）**：**完整、追加式**的对话历史，以 **JSONL** 结构化存储——凡是写过 store 的消息（heartbeat 触发、AI 回复、工具调用、compact 摘要）都会由 `persistHistory` / `appendChatlogRecord` 归档成一行一个 JSON 记录：`{ role, kind, content, ts, reasoningContent?, metadata? }`。assistant 记录会保存**思考过程**（`reasoningContent`，来自模型的 `reasoning_content`）——聊天时它实时以 `reasoning_delta` 事件流式给前端，之后从归档里也能读到。compact 只会折叠/删除 store 里的消息，**绝不触碰**这些文件，所以任何细节都不会丢失。同一天的追加在**进程内串行化**（`appendChatlogRecord` 按日历日在队列里排队执行），并发 `/chat` + `/heartbeat` 写同一天文件时不会因"最后写入者胜"丢行。读取方式：
+   - **`GET /history`**——读归档（不是 store），因此即使被 compact 折叠过，完整历史依然可查。参数：`?conversation_id=eo-self`（默认）、`?days=30`（1–90）、`?keyword=…`（对 `content` 与 `reasoningContent` 大小写不敏感搜索）、`?limit=200`（1–1000）、`?include=all`（包含 heartbeat 触发 + compact 摘要；默认会隐藏 `kind=heartbeat` 与 `kind=summary`，只返回真实对话/回复/工具调用）。返回 `{ ok, messages: [{ role, content, kind, ts, reasoningContent? }], conversationId, days, count }`——前端拿到结构化记录即可渲染（含思考）。`keyword` 路径返回完整命中的结构化消息（不再是行片段）；`limit` 对 keyword 路径同样生效——保留**最近 N 条命中**（命中按天从新到旧排序）。
+   - **`chatlog_search`**——跨归档关键词搜索（消息内容 + 思考），返回按天分组的命中结构化消息。
+   - **`chatlog_read`**——读某一天（`chatlog/YYYY-MM-DD.jsonl`）或最近 N 天的完整归档，输出为结构化/可读记录。
    两个 chatlog 工具都是零 sandbox、纯强一致 Blob 读取，并注册进 heartbeat 的完整工具集。
 
 `memory/` 前缀的 blob key 是 agent 全局的（不按会话加前缀），所有读写走强一致 Blob。
+
+### 旧 markdown chatlog 迁移
+
+历史曾经以零散的 markdown 对话文件（例如 `chatlog/YYYY-MM-DD.md` 或类似的按天 `.md` 转写）保存。当前代码**不再读取**这些文件：`/history` 与 `chatlog_*` 工具只加载 `chatlog/YYYY-MM-DD.jsonl`。部署环境里遗留的 `.md` 归档**不会自动迁移**——对当前读取器而言它们不可见；那些"还记得有旧对话"的用户会看到历史凭空消失（实际只是格式不被读了）。
+
+若线上还有需要保留的 `.md` chatlog 数据：
+
+- **一次性转换**——逐行读取旧 `.md` 文件，把每条对话追加成对应 `chatlog/YYYY-MM-DD.jsonl` 的一行 JSON（每行必须是 `JSON.stringify({ role, kind, content, ts })`）。可用 `blob_read`/`blob_write`（或 `web` 代理）跑一个小的一次性脚本，不动业务代码。
+- **或明确弃用**——确认旧数据不再需要后改名/删除遗留文件，并牢记当前 README 的"只认 JSONL"契约，回答"我的历史去哪了"时以此为据。
 
 ## 环境变量
 
@@ -131,7 +140,7 @@ alive/
 | --------------------- | --------------------- | -------------------------------------------- |
 | `AI_GATEWAY_API_KEY`  | 是                    | AI Gateway 密钥（Makers CLI 部署时自动注入） |
 | `AI_GATEWAY_BASE_URL` | 是                    | AI Gateway base URL（自动注入）              |
-| `AI_GATEWAY_MODEL`    | 否                    | 模型名，默认 `@makers/deepseek-v4-flash`     |
+| `AI_GATEWAY_MODEL`    | 否                    | 模型名，默认 `@makers/deepseek-v4-flash`；可加后缀 `:none\|:low\|:medium\|:high\|:max` 控制思考强度（`:none` 关闭思考；后缀会先剥掉，`model` 字段只发去掉后缀的名字）     |
 | `TAVILY_API_KEY`      | 否（web_search 需要） | Tavily Web Search API 密钥，需手动 `env set` |
 | `ALIVE_AUTH_TOKEN`    | 否                    | 可选 Bearer Token；设置后 `/chat`、`/history`、`/stop` 需要 `Authorization: Bearer <token>`。不设置则全部开放（本地开发默认） |
 
@@ -140,6 +149,8 @@ alive/
 ## 可选 Token 鉴权
 
 设置 `ALIVE_AUTH_TOKEN` 可保护**面向用户**的端点：设置后 `/chat`、`/history`、`/stop` 需要 `Authorization: Bearer <token>`（精确、大小写敏感比较）。不设置或为空则全部开放——这是本地开发的默认状态。
+
+> **公开部署告警：** `/history` 与 `chatlog_*` 工具读取**完整归档**，包括 assistant 记录的 `reasoningContent`（DeepSeek 思考过程）——即 AI 的私有内心独白。若在没有 `ALIVE_AUTH_TOKEN` 的情况下部署到公网，**任何匿名访客都能读取 agent 的私密思考与全部对话历史**。这是新增的暴露面（heartbeat + 归档 + 思考）。任何公开部署都必须：设置 `ALIVE_AUTH_TOKEN`、在函数前加网关级认证，或删除 `edgeone.json` 中的 `schedules` 条目（让 agent 不被无人值守地唤醒）。
 
 `/heartbeat` **刻意不做鉴权**：EdgeOne schedules 触发唤醒时不会携带 token，若在这里要求鉴权会静默掐断自主循环。代价是公开的 `/heartbeat` 可以被任何人 POST——成本仍然有界（免费版下每天一次唤醒；纯思考回合几乎不碰沙箱），但确实允许任何人触发一次 LLM 调用。若要彻底关闭它，请删除 `edgeone.json` 中的 `schedules` 条目（agent 将不再被唤醒），或在函数前再加网关级认证。
 
@@ -157,7 +168,7 @@ curl https://<你的部署域名>/history?days=30 -H 'authorization: Bearer <tok
 - **`ai_response`**——模型的每个文本增量是一条事件：
   `{ "type": "ai_response", "content": "<增量>", "streamed": true }`（逐 token 重复，形成打字机效果）。
 - **`reasoning_delta`**——当模型流式输出 `reasoning_content`（DeepSeek 思考过程）时，每段思考增量单独发一条事件：
-  `{ "type": "reasoning_delta", "content": "<增量>" }`，且总是出现在最终正文之前。随附的 web 前端（`web/index.html`）会把这些增量折叠成回复气泡上方的可折叠「💭 思考过程」区块（同样有打字机效果）。思考过程**只流式展示、不落库**。
+  `{ "type": "reasoning_delta", "content": "<增量>" }`，且总是出现在最终正文之前。随附的 web 前端（`web/index.html`）会把这些增量折叠成回复气泡上方的可折叠「💭 思考过程」区块（同样有打字机效果）。思考过程不仅实时流式展示，**完整内容也会归档进 JSON chatlog 记录（`reasoningContent`）**，之后可通过 `/history` 与 `chatlog_*` 工具随时翻查——只是刻意不进 compact 管理的 store 行，让模型上下文保持简洁。
 - **`tool_call` / `tool_result`（全程打字机）**——流式调用同样携带**完整工具集**，工具执行全程保持流式：模型请求工具时，累积的 tool_calls delta 会被还原成
   `{ "type": "tool_call", "name": "<工具名>", "arguments": <解析后的参数> }`（工具开始事件）与
   `{ "type": "tool_result", "name": "<工具名>", "content": "<截断后的结果>" }`（工具结果事件）。结果会追加回消息数组，紧接着的下一轮 `streamChatCompletion` 继续流式输出正文——最终回复依旧是 `"streamed": true` 的 `ai_response`，**不再退化为一次性回复**。整个回合都被 `CHAT_MAX_TURNS` 约束；工具抛错也只会变成 `isError` 结果（规则 #11），不会中断流。
@@ -271,9 +282,9 @@ npm test            # node --test tests/*.test.ts（node:test，无需额外框�
 - **Matrix 接入预留**：`chat.ts` + `stop.ts` 已具备对话与中止能力，但尚未接入任何即时通讯协议。
 - **edgeone.json framework/outputDirectory（P2-8）**：Makers 平台配置待部署确认，暂不改动。
 - **无长期蒸馏策略**：`MEMORY.md` 由 AI 用 `blob_*` 自由读写（想写就写），不做全量 LLM 蒸馏；历史每次请求以标准 messages 数组注入，靠 auto-compact 折叠最旧 20% 控制长度（其余由网关上下文处理）。完整原始历史永不会丢——每条消息都以 append-only 方式归档进 `chatlog/`，可通过 `GET /history` 与 `chatlog_*` 工具查看。后续可升级为定期归纳日记为长期笔记。
-- **日记追加在极端并发下可能丢一条（P1-3）**：`appendDailyLog` 是非原子的读-改-写；同一日历日被并发追加时（公开 `/heartbeat` 可被并发 POST）最后写入者胜，可能丢掉一条记录。单写者（每小时一次 heartbeat）语义下安全；后续可引入 Blob append 原语修复。
+- **日记追加在极端并发下可能丢一条（P1-3）**：`appendDailyLog` 是非原子的读-改-写；同一日历日被并发追加时（公开 `/heartbeat` 可被并发 POST）最后写入者胜，可能丢掉一条记录。单写者（每小时一次 heartbeat）语义下安全；后续可引入 Blob append 原语修复。（chatlog 归档**没有**这个缺口——`appendChatlogRecord` 已在进程内对同一天追加做串行化。）
 - **统一日期校验口径**：所有日记 / chatlog 读写路径都用 `dateFromDay` 的 round-trip 校验 `YYYY-MM-DD`，`2026-02-31` 这类不存在的日期在所有入口都会被拒绝（读路径返回 `null` / 错误，而不是去探测一个错误的 blob key）。
-- **只有流式路径展示思考过程**：chat 流式路径实时发出 `reasoning_delta`（DeepSeek 思考过程），但非流式 `chatCompletion` 路径（heartbeat/compact 同理）完全不解析 `reasoning_content`。由于 chat 工具回合现在全程流式（`streamed:true` + `tool_call`/`tool_result` 事件），所有 chat 回合都能看到思考过程——该限制如今只影响 heartbeat/compact 以及 `stream:false` 的 JSON chat 路径。
+- **思考在每条 chat 路径都会归档，只有"实时展示"是流式路径独有的**：阻塞式 `chatCompletion` 路径（JSON `?stream=false` chat、heartbeat、compact）**同样会解析** `reasoning_content` 到结果里。chat 在 SSE 与 JSON 两条路径上都会把思考归档进 JSON chatlog 记录（`reasoningContent`）——只有实时 `reasoning_delta` 事件是流式路径独有（JSON 响应不再吐增量）。heartbeat 与 compact 解析了思考但**刻意不落盘**；完整归档始终可通过 `/history` 与 `chatlog_*` 工具可查。
 
 ## 许可证
 

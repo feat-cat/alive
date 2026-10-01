@@ -13,7 +13,9 @@ import { mock } from 'node:test'
 import { onRequest as chatOnRequest, runChat } from '../agents/chat.ts'
 import { onRequest as stopOnRequest, runStop } from '../agents/stop.ts'
 import { SELF_ID, type Env } from '../agents/_shared.ts'
-import { gatewayEnv, makeContext, makeMockStore } from './_helpers.ts'
+import { injectBlobStoreForTesting } from '../agents/_blob-tools.ts'
+import { dateKey } from '../agents/_memory.ts'
+import { gatewayEnv, makeContext, makeMockBlobStore, makeMockStore } from './_helpers.ts'
 
 function llmTextResponse(content: string): unknown {
   return { choices: [{ message: { content } }] }
@@ -37,6 +39,7 @@ function mockGateway(...payloads: unknown[]): { calls: number } {
 
 afterEach(() => {
   mock.restoreAll()
+  injectBlobStoreForTesting(null)
 })
 
 describe('POST /chat', () => {
@@ -193,8 +196,10 @@ describe('POST /chat', () => {
     assert.equal(store.messageLog.at(-1)?.content, '你好呀')
   })
 
-  test('streaming path: reasoning deltas arrive as reasoning_delta SSE events; only the content persists', async () => {
+  test('streaming path: reasoning deltas arrive as reasoning_delta SSE events and are archived into the chatlog JSON record', async () => {
     const store = makeMockStore()
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
     const encoder = new TextEncoder()
     const payloads = [
       { choices: [{ delta: { reasoning_content: '先' } }] },
@@ -223,9 +228,94 @@ describe('POST /chat', () => {
     assert.ok(bodyText.includes('"content":"思考"'))
     assert.ok(bodyText.includes('"type":"ai_response"'))
     assert.ok(bodyText.includes('data: [DONE]'))
-    // Reasoning is streamed but never persisted — history holds the content only.
+    // The store row stays concise — content only, no reasoning field.
     assert.equal(store.messageLog.at(-1)?.role, 'assistant')
     assert.equal(store.messageLog.at(-1)?.content, '你好')
+    assert.equal(store.messageLog.at(-1)?.metadata?.reasoningContent, undefined)
+    // The JSON chatlog record carries the full accumulated thinking.
+    const assistantRecord = (blob.blobMap.get(`chatlog/${dateKey(new Date())}.jsonl`) ?? '')
+      .split('\n')
+      .filter((line) => line.trim())
+      .map((line) => JSON.parse(line) as { role: string; kind: string; content: string; reasoningContent?: string })
+      .find((record) => record.kind === 'assistant')
+    assert.ok(assistantRecord, 'assistant record is archived')
+    assert.equal(assistantRecord?.content, '你好')
+    assert.equal(assistantRecord?.reasoningContent, '先思考')
+  })
+
+  test('streaming path: reasoning survives tool rounds by concatenating all rounds into the assistant record', async () => {
+    const store = makeMockStore()
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    const encoder = new TextEncoder()
+    const toolArgs = JSON.stringify({ query: 'x' })
+    let fetchCalls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalls += 1
+      const stream = (chunks: unknown[]) => {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (const chunk of chunks) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+            controller.close()
+          },
+        })
+        return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      }
+      if (fetchCalls === 1) {
+        return stream([
+          { choices: [{ delta: { reasoning_content: '第一轮思考' } }] },
+          { choices: [{ delta: { content: '好的，' } }] },
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'web_search', arguments: toolArgs } }] } }] },
+        ])
+      }
+      return stream([
+        { choices: [{ delta: { reasoning_content: '第二轮思考' } }] },
+        { choices: [{ delta: { content: '查完了。' } }] },
+      ])
+    })
+
+    const res = await chatOnRequest(makeContext({ store, env: gatewayEnv() as Env, body: { message: '查一下' } }))
+    assert.equal(res.status, 200)
+    await res.text()
+    assert.equal(fetchCalls, 2)
+    const assistantRecord = (blob.blobMap.get(`chatlog/${dateKey(new Date())}.jsonl`) ?? '')
+      .split('\n')
+      .filter((line) => line.trim())
+      .map((line) => JSON.parse(line) as { kind: string; content: string; reasoningContent?: string })
+      .find((record) => record.kind === 'assistant')
+    assert.equal(assistantRecord?.content, '好的，查完了。')
+    assert.equal(assistantRecord?.reasoningContent, '第一轮思考第二轮思考')
+  })
+
+  test('JSON path (stream:false): assistant reasoning from the gateway is archived into the chatlog JSON record', async () => {
+    const store = makeMockStore()
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    mock.method(globalThis, 'fetch', async () =>
+      new Response(
+        JSON.stringify({ choices: [{ message: { content: '非流式回复', reasoning_content: '非流式思考' } }] }),
+        { status: 200 },
+      ))
+
+    const res = await chatOnRequest(makeContext({
+      store,
+      env: gatewayEnv() as Env,
+      body: { message: '你好', stream: false },
+    }))
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as { ok: boolean; reply: string }
+    assert.equal(body.reply, '非流式回复')
+    // The store row stays concise; the JSON chatlog record carries the thinking.
+    assert.equal(store.messageLog.at(-1)?.content, '非流式回复')
+    assert.equal(store.messageLog.at(-1)?.metadata?.reasoningContent, undefined)
+    const assistantRecord = (blob.blobMap.get(`chatlog/${dateKey(new Date())}.jsonl`) ?? '')
+      .split('\n')
+      .filter((line) => line.trim())
+      .map((line) => JSON.parse(line) as { kind: string; content: string; reasoningContent?: string })
+      .find((record) => record.kind === 'assistant')
+    assert.equal(assistantRecord?.content, '非流式回复')
+    assert.equal(assistantRecord?.reasoningContent, '非流式思考')
   })
 
   test('tool branch: tool_call/tool_result events stream in and the answer continues ai_response streamed:true', async () => {

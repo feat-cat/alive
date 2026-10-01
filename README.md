@@ -110,11 +110,17 @@ Only `heartbeat.ts`, `chat.ts`, `history.ts`, `stop.ts` are routable endpoints; 
 ## Memory (four tiers)
 
 Managed by `_memory.ts`: a **dual-store rule** — `context.store` feeds the model
-(compact-managed, foldable), and Blob `chatlog/` keeps the complete history
-(append-only, **never** touched by compact). Every history-producing call site
-writes through the unified `persistHistory(context, conversationId, role,
-content, kind?)`, which writes the store row AND archives the same message
-(best-effort: a Blob failure degrades without breaking the main flow).
+(compact-managed, foldable), and Blob `chatlog/` keeps the complete history as
+**JSONL records** (append-only, **never** touched by compact). Every
+history-producing call site writes through the unified
+`persistHistory(context, conversationId, role, content, kind?)`, which writes
+the store row AND archives the same message to a
+`chatlog/YYYY-MM-DD.jsonl` record (best-effort: a Blob failure degrades without
+breaking the main flow). Assistant records additionally carry the DeepSeek
+`reasoning_content` thinking in a `reasoningContent` field — archived **only**
+into the JSON chatlog record and never into the compact-managed store row, so
+the model context stays concise while the full thinking survives for `/history`
+and the `chatlog_*` tools.
 
 1. **Context (context.store message history).** Heartbeat and chat share the **same fixed conversation** (`SELF_ID=eo-self`) — private thoughts and user conversations live in ONE history stream. Every request (including heartbeat) feeds the model a **standard messages array**: `loadMessages` reads the store in ascending order and restores each row to its own `{ role, content }` entry (compact `summary` messages stay in place), passed straight into the API `messages` — no text-block splicing. Tool calls are persisted into that history as assistant `kind:'tool'` records via `recordToolCalls`, so the agent's tool use is replayed like any other turn. Messages grow forever, so before each heartbeat decision **auto-compact** runs: when store usage (count / `STORE_MESSAGE_LIMIT=10000`) reaches `COMPACT_TRIGGER=0.6` (band 0.5–0.75), the **oldest 20%** is folded into one `summary` message via a single LLM call (`maxTurns:1`), old messages are deleted and the summary is appended (summary-first ensures recency is preserved). If the LLM is unavailable it degrades to skip — compaction never blocks the heartbeat; read failures degrade to `[]`.
    **Message identity markers.** System-originated rows are visibly marked so the model never mistakes them for real speech: heartbeat wake triggers load as `[system][heartbeat] …` (role stays `user`) and compact summaries as `[system][compact] …` (role stays `assistant`). Ordinary user/assistant/tool rows pass through unchanged. The system prompt (`SYSTEM_HISTORY_GUIDANCE`) explains these markers — `[system]`-prefixed content is not the user, only unprefixed messages are real conversation.
@@ -123,13 +129,34 @@ content, kind?)`, which writes the store row AND archives the same message
 
 3. **Long-term notes (Blob `MEMORY.md`).** The AI's "self" — write freely, no forced distillation, never auto-rewritten. Seeded on first run, then maintained by the AI; injected into every system prompt. Bounded: `appendMemoryNote` keeps the **last 60KB** (`MEMORY_LIMIT`) and archives the cut-off head to `memory/archive/YYYY-MM-DD.md`.
 
-4. **Chatlog archive (Blob `chatlog/YYYY-MM-DD.md`).** The **complete, append-only** conversation history — every message that touches the store (heartbeat triggers, assistant replies, tool calls, compact summaries) is also archived by `persistHistory`/`appendChatlog`, one timestamped line per message. Compact folds/removes store rows but NEVER touches these files, so no detail is ever lost. Retrieval:
-   - **`GET /history`** — reads the archive (not the store), so even after compactions the full history is queryable. Params: `?conversation_id=eo-self` (default), `?days=30` (1–90), `?keyword=…` (case-insensitive search), `?limit=200` (1–1000), `?include=all` (include heartbeat triggers + compact summaries; the default hides `kind=heartbeat` and `kind=summary` so only real conversation/replies/tool calls are returned). Returns `{ ok, messages: [{ role, content, kind, ts }], conversationId, days, count }`. **`keyword` returns matching archive line snippets, not full messages** (a snippet that isn't a full row is marked `kind:'search'` with empty `ts`); `limit` applies to the keyword path exactly like the plain read path.
-   - **`chatlog_search`** — keyword search across the archive, returns per-day matching snippets.
-   - **`chatlog_read`** — read one day (`chatlog/YYYY-MM-DD.md`) or the most recent N days of the complete archive.
+4. **Chatlog archive (Blob `chatlog/YYYY-MM-DD.jsonl`).** The **complete, append-only** conversation history stored as **JSONL** — every message that touches the store (heartbeat triggers, assistant replies, tool calls, compact summaries) is also archived by `persistHistory`/`appendChatlogRecord` as one JSON record per line: `{ role, kind, content, ts, reasoningContent?, metadata? }`. Assistant records preserve the **thinking process** (`reasoningContent`, from the model's `reasoning_content`); it is streamed live as `reasoning_delta` during chat and later readable from the archive. Compact folds/removes store rows but NEVER touches these files, so no detail is ever lost. Same-day appends are **serialized per process** (`appendChatlogRecord` chains them on a per-calendar-day queue), so concurrent `/chat` + `/heartbeat` writes to one day's file can never drop a line to a last-writer-wins race. Retrieval:
+   - **`GET /history`** — reads the archive (not the store), so even after compactions the full history is queryable. Params: `?conversation_id=eo-self` (default), `?days=30` (1–90), `?keyword=…` (case-insensitive search over `content` and `reasoningContent`), `?limit=200` (1–1000), `?include=all` (include heartbeat triggers + compact summaries; the default hides `kind=heartbeat` and `kind=summary` so only real conversation/replies/tool calls are returned). Returns `{ ok, messages: [{ role, content, kind, ts, reasoningContent? }], conversationId, days, count }` — structured records the web frontend can render (including thinking). `keyword` returns the full matching structured messages (not line fragments); `limit` applies to the keyword path exactly like the plain read path — the most recent N matches (hits are ordered newest-day first).
+   - **`chatlog_search`** — keyword search across the archive (content + reasoning), returns per-day matching structured messages.
+   - **`chatlog_read`** — read one day (`chatlog/YYYY-MM-DD.jsonl`) or the most recent N days of the complete archive as structured/readable records.
    Both chatlog tools are zero-sandbox, pure strong-consistency Blob reads, registered in the heartbeat full tool set.
 
 `memory/` blob keys are agent-global (not per-conversation); all reads/writes go through strongly-consistent Blob.
+
+### Legacy markdown chatlog migration
+
+The chatlog archive was previously written as loose markdown transcript files
+(e.g. `chatlog/YYYY-MM-DD.md` or similar per-day `.md` transcripts). The code no
+longer reads those files: `/history` and the `chatlog_*` tools only load
+`chatlog/YYYY-MM-DD.jsonl`. Any legacy `.md` archive present on a deployed
+environment is **not automatically migrated** — it is simply invisible to the
+current reader, and a user who "remembers" old conversations would see them
+missing instead of gone.
+
+If you have production `.md` chatlog data you want to keep:
+
+- **One-time conversion** — read each legacy `.md` file and append one JSON line
+  per conversation entry into the matching `chatlog/YYYY-MM-DD.jsonl` (each line
+  must be `JSON.stringify({ role, kind, content, ts })`). A small one-shot script
+  run with `blob_read`/`blob_write` (or the `web` proxy) does this without
+  touching the code.
+- **Or explicitly deprecate it** — rename/remove legacy files after confirming
+  the data is not needed, and keep the README's JSONL-only contract in mind when
+  answering "where did my history go".
 
 ## Environment variables
 
@@ -137,7 +164,7 @@ content, kind?)`, which writes the store row AND archives the same message
 | -------------------- | ----------------- | ----------------------------------------------- |
 | `AI_GATEWAY_API_KEY` | Yes               | AI Gateway key (auto-injected by Makers CLI)    |
 | `AI_GATEWAY_BASE_URL`| Yes               | AI Gateway base URL (auto-injected)             |
-| `AI_GATEWAY_MODEL`   | No                | Model name, default `@makers/deepseek-v4-flash` |
+| `AI_GATEWAY_MODEL`   | No                | Model name, default `@makers/deepseek-v4-flash`. Optional `:none\|:low\|:medium\|:high\|:max` suffix controls the gateway `reasoning_effort` (`:none` disables thinking; the suffix is stripped before it is sent as `model`) |
 | `TAVILY_API_KEY`     | No (for web_search)| Tavily Web Search API key, set via `env set`    |
 | `ALIVE_AUTH_TOKEN`   | No                | Optional bearer token; when set, `/chat`, `/history`, `/stop` require `Authorization: Bearer <token>`. Unset = open (local dev) |
 
@@ -146,6 +173,16 @@ content, kind?)`, which writes the store row AND archives the same message
 ## Optional token auth
 
 Set `ALIVE_AUTH_TOKEN` to protect the **user-facing** endpoints: `/chat`, `/history` and `/stop` then require `Authorization: Bearer <token>` (exact, case-sensitive comparison). Unset or empty keeps everything open — the default for local development.
+
+> **Public deployment warning:** `/history` and the `chatlog_*` tools read the
+> FULL archive, including assistant `reasoningContent` (DeepSeek thinking) —
+> the agent's private internal monologue. If you deploy to a public URL without
+> `ALIVE_AUTH_TOKEN`, **any anonymous caller can retrieve the agent's private
+> thinking and its entire conversation history**. This is a new exposure surface
+> (heartbeat + archive + thinking). For any public deployment: set
+> `ALIVE_AUTH_TOKEN`, configure gateway-level auth in front of the whole
+> function, or remove the `schedules` entry from `edgeone.json` so the agent
+> never runs unattended.
 
 `/heartbeat` is deliberately **not** gated: EdgeOne schedules wake the agent without carrying a token, so requiring auth there would silently kill the autonomous loop. The trade-off is that a public `/heartbeat` can be POSTed by anyone — cost stays bounded (one daily wake on the free plan; pure-thinking turns rarely touch the sandbox), but it does let anyone trigger a single LLM turn. If you need to lock it down completely, remove the `schedules` entry from `edgeone.json` (the agent simply stops waking) or place gateway-level auth in front of the whole function.
 
@@ -168,8 +205,11 @@ default — the reply appears token-by-token instead of as one JSON blob:
   thinking), each thinking delta is sent as a separate event:
   `{ "type": "reasoning_delta", "content": "<delta>" }`, always before the final
   answer. The bundled web frontend (`web/index.html`) folds them into a
-  collapsible "💭 思考过程" block above the answer bubble (same typewriter
-  effect). Reasoning is **streamed but never persisted** to history.
+   collapsible "💭 思考过程" block above the answer bubble (same typewriter
+   effect). The complete thinking is ALSO archived on the JSON chatlog record
+   (`reasoningContent`), so it stays queryable later via `/history` and the
+   `chatlog_*` tools — it is deliberately kept OUT of the compact-managed store
+   row so the model context stays concise.
 - **`tool_call` / `tool_result` (全程打字机)** — chat carries the **full tool
   registry** on the streaming call, and tool execution is **fully streaming**:
   when the model requests tools, the accumulated `tool_call` deltas are
@@ -306,15 +346,9 @@ Tests are fully mocked (in-memory store/sandbox/Blob, `globalThis.fetch` mocked 
 - **Matrix integration reserved:** `chat.ts` + `stop.ts` provide conversation & abort, but no IM protocol is wired yet.
 - **edgeone.json framework/outputDirectory (P2-8):** Makers platform config pending deployment confirmation.
 - **No long-term distillation strategy:** `MEMORY.md` is written freely by the AI (no forced full-LLM distillation); history is injected per request as a standard messages array, bounded by auto-compact folding the oldest 20% (plus the gateway's own context handling). The full original history is never lost, though — every message is archived append-only to `chatlog/` and reachable via `GET /history` + the `chatlog_*` tools. Periodic diary-to-notes summarization can be added later.
-- **Diary append can lose one entry under extreme concurrency (P1-3):** `appendDailyLog` is a non-atomic read-modify-write; if the same calendar day is appended to concurrently (the public `/heartbeat` can be POSTed in parallel) the last writer wins and one entry may be dropped. Safe under the single-writer heartbeat semantics; a future Blob-append primitive would close the gap.
+- **Diary append can lose one entry under extreme concurrency (P1-3):** `appendDailyLog` is a non-atomic read-modify-write; if the same calendar day is appended to concurrently (the public `/heartbeat` can be POSTed in parallel) the last writer wins and one entry may be dropped. Safe under the single-writer heartbeat semantics; a future Blob-append primitive would close the gap. (The chatlog archive does NOT have this gap — `appendChatlogRecord` serializes same-day appends per process.)
 - **Unified calendar validation:** all diary/chatlog read + write paths validate `YYYY-MM-DD` with the `dateFromDay` round-trip, so impossible dates like `2026-02-31` are rejected everywhere (reads return `null` / an error instead of silently probing a wrong blob key).
-- **Reasoning only streams on the streaming path:** the chat streaming path
-  emits `reasoning_delta` events (DeepSeek thinking) live, but the non-streaming
-  `chatCompletion` path (heartbeat/compact) does not parse `reasoning_content`
-  at all. Since chat tool turns now STREAM the full loop (`streamed:true`
-  throughout, `tool_call`/`tool_result` events), every chat turn shows thinking
-  — this limitation now only applies to heartbeat/compact and the JSON
-  (`stream:false`) chat path.
+- **Reasoning is archived on every chat path, only *streamed* on the streaming path:** the blocking `chatCompletion` path (JSON `?stream=false` chat, heartbeat, compact) DOES parse `reasoning_content` into the result. Chat persists it into the JSON chatlog record (`reasoningContent`) on both the SSE and JSON paths — only the live `reasoning_delta` events are streaming-path-only (the JSON response never emits them). Heartbeat and compact parse reasoning but deliberately do NOT persist it; the full archive remains readable via `/history` and the `chatlog_*` tools.
 
 ## License
 

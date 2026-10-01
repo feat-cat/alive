@@ -36,7 +36,8 @@ import {
   readChatlogFile,
   readDailyFile,
   readRecentChatlog,
-  searchChatlog,
+  renderChatlogMessages,
+  searchChatlogJSON,
   searchDaily,
 } from './_memory.ts'
 
@@ -248,7 +249,7 @@ const CHATLOG_TOOLS: Array<{
 }> = [
   {
     name: 'chatlog_search',
-    description: 'Case-insensitive keyword search across the recent chatlog archive (the complete, never-compacted conversation history). Returns per-day matching snippets.',
+    description: 'Case-insensitive keyword search across the recent chatlog archive (the complete, never-compacted conversation history; matches both message content and the assistant thinking / reasoning). Returns per-day matching messages.',
     parameters: {
       keyword: stringSchema('Keyword to search for in the chatlog archive'),
       days: { type: 'number', description: 'How many recent days to search (default 30, clamped 1-90)' },
@@ -259,9 +260,9 @@ const CHATLOG_TOOLS: Array<{
         if (!keyword) return { content: 'chatlog_search requires "keyword".', isError: true }
         const requested = typeof args.days === 'number' ? args.days : 30
         const days = Math.min(Math.max(Math.round(requested), 1), 90)
-        const hits = await searchChatlog(tc.context, tc.conversationId, keyword, days)
+        const hits = await searchChatlogJSON(tc.context, tc.conversationId, keyword, days)
         if (hits.length === 0) return { content: `No chatlog matches for "${keyword}".` }
-        const blocks = hits.map((hit) => `## ${hit.day}\n${hit.snippets.map((line) => `- ${line}`).join('\n')}`)
+        const blocks = hits.map((hit) => `## ${hit.day}\n${renderChatlogMessages(hit.messages)}`)
         return { content: blocks.join('\n\n') }
       } catch (error) {
         return { content: error instanceof Error ? error.message : String(error), isError: true }
@@ -270,7 +271,7 @@ const CHATLOG_TOOLS: Array<{
   },
   {
     name: 'chatlog_read',
-    description: 'Read one chatlog archive day (chatlog/YYYY-MM-DD.md), or omit "day" to read the most recent N days of the complete conversation history (heartbeat triggers, tool calls, compact summaries and all).',
+    description: 'Read one chatlog archive day (chatlog/YYYY-MM-DD.jsonl) as structured messages (role, kind, content, timestamp, and the assistant reasoning when present), or omit "day" to read the most recent N days of the complete conversation history (heartbeat triggers, tool calls, compact summaries and all).',
     parameters: {
       day: optionalString('Date in YYYY-MM-DD format, or a full chatlog/… key (optional)'),
       days: { type: 'number', description: 'How many recent days to read when "day" is omitted (default 7, clamped 1-90)' },
@@ -283,9 +284,9 @@ const CHATLOG_TOOLS: Array<{
           if (day === null) {
             return { content: 'chatlog_read "day" must be YYYY-MM-DD or a chatlog/… key.', isError: true }
           }
-          const content = await readChatlogFile(tc.context, tc.conversationId, day)
-          if (content === null) return { content: `No chatlog for ${day}.`, isError: true }
-          return { content: `## ${day}\n${content}` }
+          const messages = await readChatlogFile(tc.context, tc.conversationId, day)
+          if (messages === null) return { content: `No chatlog for ${day}.`, isError: true }
+          return { content: `## ${day}\n${renderChatlogMessages(messages)}` }
         }
         const requested = typeof args.days === 'number' ? args.days : 7
         const days = Math.min(Math.max(Math.round(requested), 1), 90)
@@ -300,7 +301,7 @@ const CHATLOG_TOOLS: Array<{
 
 /** Accept a bare YYYY-MM-DD or a full chatlog blob key; return the date or null. */
 function normalizeChatlogDay(value: string): string | null {
-  const stem = value.trim().replace(/^chatlog\//, '').replace(/\.md$/, '')
+  const stem = value.trim().replace(/^chatlog\//, '').replace(/\.jsonl$/, '')
   // Round-trip validation (rejects impossible dates like 2026-02-31), matching
   // readChatlogFile and the diary read/write paths.
   return dateFromDay(stem) ? stem : null
