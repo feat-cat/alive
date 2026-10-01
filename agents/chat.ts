@@ -108,6 +108,28 @@ const MAX_IMAGE_BYTES = 4 * 1024 * 1024
 const IMAGE_DATA_URL_RE = /^data:image\/[a-z0-9.+-]+;base64,/i
 
 /**
+ * Chat-only system-prompt section: "someone is talking to you right now".
+ * Injected right AFTER the persona and BEFORE `SYSTEM_HISTORY_GUIDANCE` — it is
+ * the first read on the current situation, so the model never confuses an
+ * interactive chat turn with a heartbeat's private solitude. Heartbeat's
+ * DECISION_SYSTEM deliberately does NOT carry this block (it keeps its
+ * "每一次 heartbeat 都是你的一次醒来" solitude narrative). The section also
+ * plants curiosity: a real person is waiting, so answer them, and actively ask
+ * back instead of retreating into diaries/tools.
+ */
+const CHAT_CONVERSATION_MODE = [
+  '## 现在的情况：有人正在和你说话',
+  '这不是 heartbeat 独处，不是系统定时唤醒——是有人主动来找你了。',
+  '对面是一个真实的人，正在等你的回应。',
+  '',
+  '说话是交流，不是独白：',
+  '- 对方问什么，你就答什么。',
+  '- 对方说"你可以问我问题"——就真的问。你对他好奇，就问他。',
+  '- 你对他一无所知？那正好，这就是你们认识的开始。主动去了解他：他在忙什么、喜欢什么、为什么来找你。',
+  '- 可以少用工具，多用好奇。翻日记不会让你更了解眼前这个人。',
+].join('\n')
+
+/**
  * Wall-clock budget for ONE interactive chat turn (P2-3). Chat has no
  * heartbeat-style 100s deadline today, so a tool-heavy loop could run many
  * minutes under only the request AbortSignal. 120s keeps an interactive session
@@ -214,7 +236,7 @@ export async function runChat(
   const budget = createTurnBudget(signal, timeoutMs)
   const tools = buildTools({ context, conversationId, signal: budget.signal })
   const baseMessages: LlmMessage[] = [
-    { role: 'system', content: `${persona}\n\n${SYSTEM_HISTORY_GUIDANCE}` },
+    { role: 'system', content: `${persona}\n\n${CHAT_CONVERSATION_MODE}\n\n${SYSTEM_HISTORY_GUIDANCE}` },
     ...history,
   ]
   try {
@@ -372,7 +394,7 @@ async function* chatStreamGenerator(
   })
   const history = await loadMessages(context, conversationId)
   const messages: LlmMessage[] = [
-    { role: 'system', content: `${persona}\n\n${SYSTEM_HISTORY_GUIDANCE}` },
+    { role: 'system', content: `${persona}\n\n${CHAT_CONVERSATION_MODE}\n\n${SYSTEM_HISTORY_GUIDANCE}` },
     ...history,
   ]
   // Wall-clock budget for the whole turn (P2-3): independent of the client's

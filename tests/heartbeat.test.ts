@@ -568,6 +568,18 @@ describe('POST /heartbeat', () => {
     assert.ok(DECISION_SYSTEM.indexOf('能一句话说完') < DECISION_SYSTEM.indexOf('[system]'))
   })
 
+  test('DECISION_SYSTEM stays in its solitude narrative — chat-only conversation-mode never leaks in', () => {
+    // The "someone is talking to you" block lives only in agents/chat.ts. A
+    // heartbeat prompt must keep the solitude framing even when it reads chat
+    // history in the shared stream — the two modes stay distinguishable.
+    assert.doesNotMatch(DECISION_SYSTEM, /有人正在和你说话/)
+    assert.doesNotMatch(DECISION_SYSTEM, /对方问什么，你就答什么/)
+    assert.doesNotMatch(DECISION_SYSTEM, /可以少用工具，多用好奇/)
+    // The new distinction line still keeps the solitude voice first.
+    assert.match(DECISION_SYSTEM, /把这段独处过好/)
+    assert.match(DECISION_SYSTEM, /好好跟人说话/)
+  })
+
   test('the system message sent to the gateway is unique and first', async () => {
     const store = makeMockStore({ [SELF_ID]: { [SELF_STATE_KEY]: defaultSelfState() } })
     store.addMessage(SELF_ID, { role: 'user', content: '早先的问题', metadata: {} })

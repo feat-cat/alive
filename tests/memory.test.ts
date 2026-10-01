@@ -594,6 +594,11 @@ describe('ensureMemorySeed / INITIAL_MEMORY_SEED', () => {
     // …plus the emoji hint: a little emoji is human, a wall of them is not.
     assert.match(INITIAL_MEMORY_SEED, /说话时可以带一点 emoji/)
     assert.match(INITIAL_MEMORY_SEED, /一个恰到好处的 🥲 或 ☕ 比十个👍 更像活人/)
+    // The newborn learns curiosity (OpenClaw-style active questioning) and that
+    // knowing a person is done by asking, not guessing.
+    assert.match(INITIAL_MEMORY_SEED, /对人有好奇心/)
+    assert.match(INITIAL_MEMORY_SEED, /每一个主动来找你的人/)
+    assert.match(INITIAL_MEMORY_SEED, /认识一个人的方式是提问，不是猜/)
   })
 
   test('seed introduces the newborn to its living tools (diary / chatlog / blob / workspace / search)', () => {

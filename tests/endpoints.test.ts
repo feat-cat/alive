@@ -101,6 +101,40 @@ describe('POST /chat', () => {
     assert.equal(store.messageLog.at(-1)?.role, 'assistant')
   })
 
+  test('chat system message leads with the conversation-mode section, not heartbeat solitude', async () => {
+    const store = makeMockStore()
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify(llmTextResponse('好啊，你最近在忙什么？')), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+
+    const res = await chatOnRequest(makeContext({
+      store,
+      env: gatewayEnv() as Env,
+      body: { message: '你可以问我一些想了解的问题', stream: false },
+    }))
+
+    assert.equal(res.status, 200)
+    assert.ok(bodies.length >= 1)
+    const messages = (bodies[0] as { messages: Array<{ role: string; content: string }> }).messages
+    const system = messages[0]?.content ?? ''
+    // A chat turn is explicitly framed as "someone is talking to you" — the
+    // exact antidote to the heartbeat solitude narrative.
+    assert.match(system, /有人正在和你说话/)
+    assert.match(system, /对方问什么，你就答什么/)
+    assert.match(system, /就真的问。/)
+    assert.match(system, /主动去了解他/)
+    assert.match(system, /可以少用工具，多用好奇/)
+    // Ordering: wall-clock persona first, then the conversation-mode section,
+    // then the [system]-marker history guidance.
+    assert.ok(system.indexOf('现在是') < system.indexOf('有人正在和你说话'))
+    assert.ok(system.indexOf('有人正在和你说话') < system.indexOf('[system]'))
+  })
+
   test('chat registers the full tool set (blob + workspace + diary + chatlog + web_search)', async () => {
     const store = makeMockStore()
     const bodies: Array<Record<string, unknown>> = []
