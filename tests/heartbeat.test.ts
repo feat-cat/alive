@@ -573,8 +573,8 @@ describe('POST /heartbeat', () => {
     // heartbeat prompt must keep the solitude framing even when it reads chat
     // history in the shared stream — the two modes stay distinguishable.
     assert.doesNotMatch(DECISION_SYSTEM, /有人正在和你说话/)
-    assert.doesNotMatch(DECISION_SYSTEM, /对方问什么，你就答什么/)
-    assert.doesNotMatch(DECISION_SYSTEM, /可以少用工具，多用好奇/)
+    assert.doesNotMatch(DECISION_SYSTEM, /万能问题/)
+    assert.doesNotMatch(DECISION_SYSTEM, /少用工具，多用好奇/)
     // The new distinction line still keeps the solitude voice first.
     assert.match(DECISION_SYSTEM, /把这段独处过好/)
     assert.match(DECISION_SYSTEM, /好好跟人说话/)

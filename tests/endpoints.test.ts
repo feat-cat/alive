@@ -125,10 +125,14 @@ describe('POST /chat', () => {
     // A chat turn is explicitly framed as "someone is talking to you" — the
     // exact antidote to the heartbeat solitude narrative.
     assert.match(system, /有人正在和你说话/)
-    assert.match(system, /对方问什么，你就答什么/)
-    assert.match(system, /就真的问。/)
-    assert.match(system, /主动去了解他/)
-    assert.match(system, /可以少用工具，多用好奇/)
+    // The conversation-mode section is an attitude demonstration (OpenClaw
+    // SOUL.md spirit), not a fill-in-the-blank question template: have an
+    // opinion, skip the pleasantries, stay terse, call out nonsense.
+    assert.match(system, /有观点/)
+    assert.match(system, /别客套/)
+    assert.match(system, /万能问题/)
+    assert.match(system, /敢说破/)
+    assert.match(system, /少用工具，多用好奇/)
     // Ordering: wall-clock persona first, then the conversation-mode section,
     // then the [system]-marker history guidance.
     assert.ok(system.indexOf('现在是') < system.indexOf('有人正在和你说话'))
