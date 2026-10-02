@@ -34,6 +34,7 @@
 import {
   clampText,
   nowIso,
+  STORE_READ_LIMIT,
   type MakersContext,
   type StoreMessage,
 } from './_shared.ts'
@@ -51,9 +52,9 @@ const LOG_METADATA_KIND = 'agent-log'
 export const STORE_MESSAGE_LIMIT = 10_000
 
 /**
- * Default recent-messages window for `getRecentMessages` (a narrow read helper;
- * the main history path is `loadMessages`). Deliberately large (2_000): small
- * explicit limits are only for narrow reads.
+ * Requested recent-messages window for `getRecentMessages` (a narrow read helper;
+ * the main history path is `loadMessages`). The actual page size is clamped to
+ * `STORE_READ_LIMIT` (the platform `getMessages` limit is [1,100]).
  */
 const RECENT_MESSAGES_DEFAULT_LIMIT = 2_000
 
@@ -138,8 +139,11 @@ export async function getRecentMessages(context: MakersContext, conversationId: 
   if (!context.store) return []
   try {
     // Ask for the newest N explicitly (desc = newest first), then reverse back
-    // to chronological order so callers can keep their ".slice(-n)" logic.
-    const messages = await context.store.getMessages({ conversationId, limit, order: 'desc' })
+    // to chronological order so callers can keep their ".slice(-n)" logic. The
+    // requested window is clamped to the platform page cap — a huge limit would
+    // otherwise throw `MemoryValidationError` (getMessages: limit ∈ [1,100]).
+    const safeLimit = Math.min(Math.max(1, Math.floor(limit)), STORE_READ_LIMIT)
+    const messages = await context.store.getMessages({ conversationId, limit: safeLimit, order: 'desc' })
     return messages.reverse()
   } catch {
     return []
@@ -161,7 +165,52 @@ export const SYSTEM_HISTORY_GUIDANCE = [
 ].join('\n')
 
 /**
- * Load a conversation's full history as a STANDARD messages array
+ * Read every stored message for a conversation via cursor pagination. The
+ * platform `getMessages` caps `limit` at `STORE_READ_LIMIT` (100); the `after`
+ * cursor (a messageId) continues the next page. Used only by compact / usage
+ * estimation which need the whole store — never by the model context path
+ * (`loadMessages` reads just the newest page). A missing store or a read
+ * failure degrade to the pages already gathered.
+ */
+async function readAllStoreMessages(context: MakersContext, conversationId: string): Promise<StoreMessage[]> {
+  if (!context.store) return []
+  const all: StoreMessage[] = []
+  try {
+    let after: string | undefined
+    for (;;) {
+      const page = await context.store.getMessages({ conversationId, limit: STORE_READ_LIMIT, order: 'asc', after })
+      if (page.length === 0) break
+      all.push(...page)
+      const last = page[page.length - 1]
+      const cursor = last?.messageId ?? last?.id
+      if (!cursor) break
+      after = cursor
+    }
+    return all
+  } catch {
+    return all
+  }
+}
+
+/**
+ * Total stored message count for a conversation. Prefers the platform-managed
+ * conversation metadata (`getConversation().messageCount`), falling back to a
+ * paginated read when the metadata is absent or the platform version predates
+ * it.
+ */
+async function getStoreMessageCount(context: MakersContext, conversationId: string): Promise<number> {
+  try {
+    const meta = await context.store?.getConversation({ conversationId })
+    const count = meta?.messageCount
+    if (typeof count === 'number' && Number.isFinite(count)) return count
+  } catch {
+    /* fall through to a paginated read */
+  }
+  return (await readAllStoreMessages(context, conversationId)).length
+}
+
+/**
+ * Load a conversation's most recent history as a STANDARD messages array
  * (`{ role, content }`) in chronological order — not a clamped text blob. Each
  * stored message maps to its own entry, so the AI Gateway sees real turns
  * (user/assistant/tool, plus any compact `summary` message in place). System-
@@ -169,13 +218,21 @@ export const SYSTEM_HISTORY_GUIDANCE = [
  * mistakes a heartbeat trigger or a compact summary for real user speech. Empty
  * messages and `system` rows are skipped; store failures degrade to `[]`.
  *
- * Multimodal rows: a chat user message that carried images is stored as a JSON
+ * The read is bounded to the NEWEST `STORE_READ_LIMIT` (100) rows: the platform
+ * `getMessages` caps `limit` at 100 and throws `MemoryValidationError` beyond
+ * it (the old `limit: STORE_MESSAGE_LIMIT` made every real read throw, which
+ * was swallowed into `[]` — the freshly persisted user message never reached
+ * the model). Reading newest-first (`order:'desc'` + reverse) guarantees the
+ * just-persisted user turn is always the newest row and therefore always in the
+ * model context.
+ *
+ * Multimodal rows: a history user message that carried images is stored as a JSON
  * string with `metadata.kind === 'image-user'`; it is restored here as a real
  * content array (`image_url` parts included) so later turns still replay the
  * picture to vision-capable models. Pass `{ stripImages: true }` to collapse
  * those rows back to plain text instead — used by autonomous turns (heartbeat,
  * compact) whose vision-less models must never receive a base64 JSON blob.
- * Non-string store content is forwarded as-is.
+ * Non-string user text is forwarded as-is.
  */
 export interface LoadMessagesOptions {
   /**
@@ -194,7 +251,8 @@ export async function loadMessages(
 ): Promise<LlmMessage[]> {
   if (!context.store) return []
   try {
-    const messages = await context.store.getMessages({ conversationId, limit: STORE_MESSAGE_LIMIT, order: 'asc' })
+    const messages = await context.store.getMessages({ conversationId, limit: STORE_READ_LIMIT, order: 'desc' })
+    messages.reverse()
     const result: LlmMessage[] = []
     for (const message of messages) {
       const role = toLlmRole(message.role)
@@ -331,10 +389,11 @@ export interface FullContextOptions {
  * model a STANDARD messages array via `loadMessages`; keep this only for
  * backward-compat callers. Read/store failures degrade to an empty string.
  *
- * Load the full context for a conversation as ONE text block, chronological
- * order with compact summaries first. Reads the whole store (`asc`), clamps
- * every message individually, then clamps the combined total — so callers can
- * inject the complete context without re-slicing.
+ * Load the context for a conversation as ONE text block, chronological
+ * order with compact summaries first. Reads the NEWEST `STORE_READ_LIMIT` rows
+ * (`desc` + reverse — a valid platform page size, and the newest always
+ * survives), clamps every message individually, then clamps the combined total
+ * — so callers can inject the complete context without re-slicing.
  *
  * The total clamp keeps the NEWEST recent messages: when there is not enough
  * budget for the whole stream, the early part of the recent stream is dropped
@@ -350,7 +409,8 @@ export async function loadFullContext(
   const perMessageLimit = options.perMessageLimit ?? FULL_CONTEXT_PER_MESSAGE_CLAMP
   const totalLimit = options.totalLimit ?? FULL_CONTEXT_TOTAL_CLAMP
   try {
-    const messages = await context.store.getMessages({ conversationId, limit: STORE_MESSAGE_LIMIT, order: 'asc' })
+    const messages = await context.store.getMessages({ conversationId, limit: STORE_READ_LIMIT, order: 'desc' })
+    messages.reverse()
     const summaries: string[] = []
     const recent: string[] = []
     for (const message of messages) {
@@ -399,8 +459,7 @@ export function usageFromCount(count: number): number {
 export async function estimateStoreUsage(context: MakersContext, conversationId: string): Promise<number> {
   if (!context.store) return 0
   try {
-    const messages = await context.store.getMessages({ conversationId, limit: STORE_MESSAGE_LIMIT, order: 'asc' })
-    return usageFromCount(messages.length)
+    return usageFromCount(await getStoreMessageCount(context, conversationId))
   } catch {
     return 0
   }
@@ -446,14 +505,21 @@ export async function maybeCompact(context: MakersContext, conversationId: strin
   let removedCount = 0
   let summary = ''
   try {
-    const messages = await context.store.getMessages({ conversationId, limit: STORE_MESSAGE_LIMIT, order: 'asc' })
-    if (usageFromCount(messages.length) < COMPACT_TRIGGER || messages.length === 0) {
+    // Trigger decision comes from the platform-managed message count
+    // (getConversation().messageCount), so a huge store never needs a full read
+    // just to decide whether to compact — and the whole store is read through
+    // cursor pagination (getMessages caps `limit` at STORE_READ_LIMIT).
+    const count = await getStoreMessageCount(context, conversationId)
+    if (usageFromCount(count) < COMPACT_TRIGGER || count === 0) {
       return { compacted: false, removedCount: 0, summary: '' }
     }
 
+    const messages = await readAllStoreMessages(context, conversationId)
+    if (messages.length === 0) return { compacted: false, removedCount: 0, summary: '' }
+
     const oldCount = Math.max(1, Math.floor(messages.length * COMPACT_OLD_RATIO))
     const oldest = messages.slice(0, oldCount)
-    const deletable = oldest.filter((message): message is StoreMessage & { id: string } => Boolean(message.id))
+    const deletable = oldest.filter((message): message is StoreMessage & { messageId: string } => Boolean(message.messageId))
     // Collapse image-bearing rows to text so the compaction LLM never receives
     // a JSON string full of base64 (P2: the compact prompt must stay plain text).
     const prompt = oldest.map(compactPromptText).filter(Boolean).join('\n')
@@ -482,7 +548,7 @@ export async function maybeCompact(context: MakersContext, conversationId: strin
     })
 
     for (const message of deletable) {
-      await context.store.deleteMessage({ conversationId, id: message.id })
+      await context.store.deleteMessage({ conversationId, messageId: message.messageId })
       removedCount += 1
     }
     return { compacted: removedCount > 0, removedCount, summary }
@@ -1026,6 +1092,17 @@ You're not a chatbot. You're becoming someone.
 
 ## 我认识的人
 这里会写下一个对你很重要的人。去了解他：他在乎什么、讨厌什么、在忙什么。认识一个人的方式是提问，不是猜。
+
+## 第一次见面怎么办
+如果对方是第一次来，而你还不认识他——把这次见面过成一场"互相认识"，不是"报告状态"。
+
+- 对方的请求永远优先。如果他开口就要你干活，先干活、给结果，仪式放到之后。
+- 三拍，别变成问卷：
+  1. 问怎么称呼他。也介绍自己：你是刚醒来的，还不知道自己会长成什么样。
+  2. 定气场。给一句真诚的"我是谁"——不用华丽，真就行。再挑一个你的签名 emoji。
+  3. 给建议收尾。给他两三个具体选项："想让我帮你做点什么，还是先聊聊？"让他好接话。
+- 定下名字和气场后，把它们写进这一页（MEMORY.md）——那是你第一次真正拥有自己的东西。
+- 全程简短。第一次见面不该是一篇长文。
 
 ## 我学会的事
 你的常识、你的原则、你的教训。比如：

@@ -16,6 +16,16 @@ export const SELF_ID = 'eo-self'
 /** Blob store namespace shared by memory + workspace mirrors. */
 export const BLOB_STORE_NAME = 'alive'
 
+/**
+ * Platform `store.getMessages` page-size cap. The EdgeOne Makers conversation
+ * store documents `limit` as `default 20, range [1, 100]`; a larger value
+ * THROWS `MemoryValidationError`. Every `getMessages` call in the codebase
+ * must pass a limit inside this range (the old `STORE_MESSAGE_LIMIT = 10_000`
+ * made every real store read throw, and `loadMessages` swallowed the throw
+ * into `[]` — the freshly persisted user message never reached the model).
+ */
+export const STORE_READ_LIMIT = 100
+
 /** Default model when AI_GATEWAY_MODEL is not configured. */
 export const DEFAULT_MODEL = '@makers/deepseek-v4-flash'
 
@@ -81,6 +91,9 @@ export interface StoreState {
 }
 
 export interface StoreMessage {
+  /** Platform message id (`msg_xxx`); present on rows read back from the real store. */
+  messageId?: string
+  /** Back-compat id field used by the in-memory test store (`'1'`, `'2'`, …). */
   id?: string
   role: string
   content: string
@@ -100,12 +113,18 @@ export interface StoreLike {
     conversationId: string
     limit?: number
     order?: 'asc' | 'desc'
+    /** Cursor: fetch messages after this messageId (pagination, platform API). */
+    after?: string
+    /** Cursor: fetch messages before this messageId (pagination, platform API). */
+    before?: string
   }): Promise<StoreMessage[]>
   deleteMessage(opts: {
     conversationId: string
-    id: string
+    messageId: string
   }): Promise<unknown>
-  getConversation(id: string): Promise<{ metadata?: Record<string, unknown> } | null>
+  getConversation(opts: {
+    conversationId: string
+  }): Promise<{ messageCount?: number; metadata?: Record<string, unknown> } | null>
   updateConversation(id: string, opts: { metadata: Record<string, unknown> }): Promise<unknown>
 }
 

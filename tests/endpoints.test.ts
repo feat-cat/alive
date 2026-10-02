@@ -101,6 +101,44 @@ describe('POST /chat', () => {
     assert.equal(store.messageLog.at(-1)?.role, 'assistant')
   })
 
+  test('P0 regression: the current user message ALWAYS reaches the gateway body, even past the store read cap', async () => {
+    // The real platform store caps `getMessages({ limit })` at 100 and THROWS
+    // `MemoryValidationError` for a larger value. loadMessages used to pass
+    // `limit: STORE_MESSAGE_LIMIT (10000)`, swallow the throw into `[]`, and
+    // feed the model a system-only array — the user message never entered the
+    // model context and it hallucinated an input. Now loadMessages reads the
+    // NEWEST page inside the platform limit, so the just-persisted user message
+    // (always the newest row) is guaranteed to be in the gateway request.
+    const store = makeMockStore()
+    for (let i = 0; i < 150; i += 1) {
+      store.addMessage(SELF_ID, { role: 'assistant', content: `old-${i}`, metadata: { logKind: 'heartbeat' } })
+    }
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify(llmTextResponse('好的。')), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+
+    const res = await chatOnRequest(makeContext({
+      store,
+      env: gatewayEnv() as Env,
+      body: { message: '今天做什么？', stream: false },
+    }))
+
+    assert.equal(res.status, 200)
+    assert.ok(bodies.length >= 1)
+    const messages = (bodies[0] as { messages: Array<{ role: string; content: string }> }).messages
+    const freshUser = messages.filter((message) => message.role === 'user' && message.content === '今天做什么？')
+    assert.equal(freshUser.length, 1, 'the just-sent user message must be fed to the model')
+    // The model sees the newest history within the platform read cap, never the
+    // full 150-message dump and never an empty array.
+    assert.ok(messages.some((message) => message.role === 'assistant' && message.content === 'old-149'))
+    assert.ok(!messages.some((message) => message.role === 'assistant' && message.content === 'old-0'))
+  })
+
   test('chat system message leads with the conversation-mode section, not heartbeat solitude', async () => {
     const store = makeMockStore()
     const bodies: Array<Record<string, unknown>> = []

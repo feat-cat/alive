@@ -43,7 +43,7 @@ import {
 } from '../agents/_memory.ts'
 import { injectBlobStoreForTesting } from '../agents/_blob-tools.ts'
 import { buildTools } from '../agents/_tools.ts'
-import { SELF_ID, type Env } from '../agents/_shared.ts'
+import { SELF_ID, STORE_READ_LIMIT, type Env } from '../agents/_shared.ts'
 import { gatewayEnv, makeContext, makeMockBlobStore, makeMockStore, type MockBlobStore, type MockStore } from './_helpers.ts'
 
 function seedMessages(store: MockStore, conversationId: string, count: number): void {
@@ -600,6 +600,16 @@ describe('ensureMemorySeed / INITIAL_MEMORY_SEED', () => {
     assert.match(INITIAL_MEMORY_SEED, /对人有态度，不只是好奇/)
     assert.match(INITIAL_MEMORY_SEED, /万能问题/)
     assert.match(INITIAL_MEMORY_SEED, /认识一个人的方式是提问，不是猜/)
+    // The OpenClaw BOOTSTRAP-style birth sequence lives in the seed: request
+    // first, then the three beats (ask the name → set the vibe → recommend), and
+    // the name+vibe are written back into MEMORY.md itself.
+    assert.match(INITIAL_MEMORY_SEED, /## 第一次见面怎么办/)
+    assert.match(INITIAL_MEMORY_SEED, /互相认识/)
+    assert.match(INITIAL_MEMORY_SEED, /对方的请求永远优先/)
+    assert.match(INITIAL_MEMORY_SEED, /三拍/)
+    assert.match(INITIAL_MEMORY_SEED, /签名 emoji/)
+    assert.match(INITIAL_MEMORY_SEED, /想让我帮你做点什么，还是先聊聊？/)
+    assert.match(INITIAL_MEMORY_SEED, /把它们写进这一页/)
   })
 
   test('seed introduces the newborn to its living tools (diary / chatlog / blob / workspace / search)', () => {
@@ -943,6 +953,33 @@ describe('loadMessages', () => {
 
     const messages = await loadMessages(makeContext({ store }), SELF_ID)
     assert.deepEqual(messages, [{ role: 'user', content: 'broken][不是JSON' }])
+  })
+
+  test('never drops the newest user row once history exceeds the platform read cap (P0 fix)', async () => {
+    // Regression: the code passed `limit: STORE_MESSAGE_LIMIT (10000)` to
+    // `getMessages`, but the real platform caps `limit` at 100 and THROWS
+    // `MemoryValidationError` for anything larger. `loadMessages` swallowed the
+    // throw into `[]`, so the freshly persisted user message never reached the
+    // model — it hallucinated an input. Now loadMessages reads the NEWEST page
+    // (desc + reverse) inside the platform limit.
+    const store = makeMockStore()
+    for (let i = 0; i < 150; i += 1) {
+      store.addMessage(SELF_ID, { role: 'assistant', content: `old-${i}`, metadata: { logKind: 'heartbeat' } })
+    }
+    store.addMessage(SELF_ID, { role: 'user', content: '现在这条消息', metadata: {} })
+
+    const messages = await loadMessages(makeContext({ store }), SELF_ID)
+
+    // The just-persisted user message MUST reach the model context.
+    assert.ok(
+      messages.some((message) => message.role === 'user' && message.content === '现在这条消息'),
+      'the freshly persisted user message must be in the model messages array',
+    )
+    // The model sees the newest page only — within the platform limit, never
+    // a throw-to-empty and never a full 151-message dump.
+    assert.ok(messages.some((message) => message.role === 'assistant' && message.content === 'old-149'))
+    assert.ok(!messages.some((message) => message.role === 'assistant' && message.content === 'old-0'))
+    assert.ok(messages.length <= STORE_READ_LIMIT)
   })
 })
 

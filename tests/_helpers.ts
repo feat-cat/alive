@@ -6,6 +6,7 @@
  * Everything is kept in plain Maps and reset per-test by the caller.
  */
 import type { Env, MakersContext, SandboxLike, StoreLike, StoreMessage } from '../agents/_shared.ts'
+import { STORE_READ_LIMIT } from '../agents/_shared.ts'
 import type { BlobStore } from '../agents/_blob-tools.ts'
 
 export interface MockStore extends StoreLike {
@@ -43,6 +44,7 @@ export function makeMockStore(initialState: Record<string, Record<string, unknow
   const addMessage: MockStore['addMessage'] = (conversationId, message) => {
     seq += 1
     const entry: StoreMessage = {
+      messageId: `msg_${seq}`,
       id: String(seq),
       role: message.role,
       content: message.content,
@@ -82,21 +84,42 @@ export function makeMockStore(initialState: Record<string, Record<string, unknow
     appendMessage: async (opts): Promise<void> => {
       addMessage(opts.conversationId, { role: opts.role, content: opts.content, metadata: opts.metadata })
     },
+    // Mirrors the real platform store: `limit` is range [1,100] (OUTSIDE it
+    // throws — a limit >100 was the root cause of loadMessages degrading to []),
+    // `order: 'desc'` returns newest first, and `after`/`before` are messageId
+    // cursors for cursor pagination.
     getMessages: async (opts): Promise<StoreMessage[]> => {
       const list = (logs.get(opts.conversationId) ?? []).filter((message) => message.role !== 'system')
-      const ordered = opts.order === 'desc' ? [...list].reverse() : [...list]
-      return ordered.slice(0, opts.limit ?? 50)
+      const limit = opts.limit ?? 50
+      if (!Number.isInteger(limit) || limit < 1 || limit > STORE_READ_LIMIT) {
+        throw new Error(`MemoryValidationError: getMessages limit out of range [1,${STORE_READ_LIMIT}]: ${String(limit)}`)
+      }
+      let window = list
+      const idOf = (message: StoreMessage): string | undefined => message.messageId ?? message.id
+      if (opts.after !== undefined) {
+        const index = list.findIndex((message) => idOf(message) === opts.after)
+        window = index >= 0 ? list.slice(index + 1) : []
+      } else if (opts.before !== undefined) {
+        const index = list.findIndex((message) => idOf(message) === opts.before)
+        window = index >= 0 ? list.slice(0, index) : list
+      }
+      const ordered = opts.order === 'desc' ? [...window].reverse() : [...window]
+      return ordered.slice(0, limit)
     },
     deleteMessage: async (opts) => {
+      const idValue = opts.messageId ?? (opts as { id?: string }).id
       const list = logs.get(opts.conversationId)
       if (list) {
-        const index = list.findIndex((message) => message.id === opts.id)
+        const index = list.findIndex((message) => (message.messageId ?? message.id) === idValue)
         if (index >= 0) list.splice(index, 1)
       }
-      const logIndex = messageLog.findIndex((message) => message.id === opts.id)
+      const logIndex = messageLog.findIndex((message) => (message.messageId ?? message.id) === idValue)
       if (logIndex >= 0) messageLog.splice(logIndex, 1)
     },
-    getConversation: async (id: string) => ({ metadata: { id } }),
+    getConversation: async (opts: { conversationId: string }) => {
+      const list = logs.get(opts.conversationId) ?? []
+      return { messageCount: list.length, metadata: { id: opts.conversationId } }
+    },
     updateConversation: async () => undefined,
     stateMap,
     messageLog,
