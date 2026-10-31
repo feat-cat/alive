@@ -13,11 +13,13 @@
  * with zero auth friction from a manual curl/browser; it shares the same cost
  * profile as one scheduled wake.
  */
-import { asMakersContext, errorResponse, jsonOk } from './_shared.ts'
+import { asMakersContext, errorResponse, jsonOk, requireAuth } from './_shared.ts'
 import { runHeartbeat } from './heartbeat.ts'
 
 export async function onRequest(context: any): Promise<Response> {
   const ctx = asMakersContext(context)
+  const denied = requireAuth(ctx)
+  if (denied) return denied
   const signal = ctx.request?.signal
   try {
     const result = await runHeartbeat(ctx, { signal })

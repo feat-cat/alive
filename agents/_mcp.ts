@@ -101,7 +101,10 @@ export function parseMcpServers(envValue: string | undefined): McpServerConfig[]
     let hostname = ''
     try {
       const parsed = new URL(url)
-      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') continue
+      // H3 (SSRF guard): only HTTPS MCP servers are reachable. A plain `http:`
+      // URL is skipped (best-effort) so the agent can never be pointed at an
+      // in-network / local MCP endpoint over cleartext.
+      if (parsed.protocol !== 'https:') continue
       hostname = parsed.hostname
     } catch {
       continue // invalid URL — best-effort skip

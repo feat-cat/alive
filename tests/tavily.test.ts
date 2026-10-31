@@ -8,12 +8,13 @@
 import { afterEach, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mock } from 'node:test'
-import { executeWebFetch, executeWebSearch } from '../agents/_tavily.ts'
+import { executeWebFetch, executeWebSearch, isPrivateUrl, setTavilyRetryForTesting, TAVILY_RETRY_MAX } from '../agents/_tavily.ts'
 
 const API_KEY = 'test-tavily-key'
 
 afterEach(() => {
   mock.restoreAll()
+  setTavilyRetryForTesting([0, 0])
 })
 
 describe('executeWebSearch time filters', () => {
@@ -177,5 +178,123 @@ describe('executeWebFetch failures', () => {
     const result = await executeWebFetch(API_KEY, { urls: ['https://example.com/page'] })
     assert.equal(result.isError, true)
     assert.match(result.content, /HTTP 502/)
+  })
+})
+
+describe('Tavily retry (M4)', () => {
+  test('429 retries then succeeds after a retryable status', async () => {
+    setTavilyRetryForTesting([0, 0])
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      if (calls === 1) return new Response('rate limited', { status: 429 })
+      return new Response(
+        JSON.stringify({ results: [{ url: 'https://example.com/page', title: 'OK', content: 'fine' }], failed_results: [] }),
+        { status: 200 },
+      )
+    })
+    const result = await executeWebFetch(API_KEY, { urls: ['https://example.com/page'] })
+    assert.equal(result.isError, undefined)
+    assert.match(result.content, /fine/)
+    assert.equal(calls, 2, '429 must be retried once before the success')
+  })
+
+  test('5xx retries then succeeds', async () => {
+    setTavilyRetryForTesting([0, 0])
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      if (calls <= 2) return new Response('upstream', { status: 503 })
+      return new Response(
+        JSON.stringify({ results: [{ url: 'https://example.com/p', title: 'Back', content: 'recovered' }], failed_results: [] }),
+        { status: 200 },
+      )
+    })
+    const result = await executeWebFetch(API_KEY, { urls: ['https://example.com/p'] })
+    assert.equal(result.isError, undefined)
+    assert.match(result.content, /recovered/)
+    assert.equal(calls, 3, '503 must be retried twice')
+  })
+
+  test('a persistent 429 surfaces as isError (retries exhausted)', async () => {
+    setTavilyRetryForTesting([0, 0])
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      return new Response('rate limited', { status: 429 })
+    })
+    const result = await executeWebFetch(API_KEY, { urls: ['https://example.com/page'] })
+    assert.equal(result.isError, true)
+    assert.match(result.content, /HTTP 429/)
+    assert.equal(calls, TAVILY_RETRY_MAX + 1)
+  })
+
+  test('a network TypeError is retried then succeeds', async () => {
+    setTavilyRetryForTesting([0, 0])
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      if (calls === 1) throw new TypeError('fetch failed')
+      return new Response(
+        JSON.stringify({ results: [{ url: 'https://example.com/net', title: 'Net', content: 'ok' }], failed_results: [] }),
+        { status: 200 },
+      )
+    })
+    const result = await executeWebFetch(API_KEY, { urls: ['https://example.com/net'] })
+    assert.equal(result.isError, undefined)
+    assert.match(result.content, /ok/)
+    assert.equal(calls, 2)
+  })
+
+  test('a 400 is NOT retried (single attempt)', async () => {
+    setTavilyRetryForTesting([0, 0])
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      return new Response('bad request', { status: 400 })
+    })
+    const result = await executeWebFetch(API_KEY, { urls: ['https://example.com/page'] })
+    assert.equal(result.isError, true)
+    assert.match(result.content, /HTTP 400/)
+    assert.equal(calls, 1, 'client errors must not be retried')
+  })
+})
+
+describe('isPrivateUrl (H3 SSRF guard)', () => {
+  test('flags loopback and private IPv4 ranges', () => {
+    assert.equal(isPrivateUrl('http://127.0.0.1/x'), true)
+    assert.equal(isPrivateUrl('http://localhost/x'), true)
+    assert.equal(isPrivateUrl('http://10.0.0.1/x'), true)
+    assert.equal(isPrivateUrl('http://172.16.0.1/x'), true)
+    assert.equal(isPrivateUrl('http://172.31.255.255/x'), true)
+    assert.equal(isPrivateUrl('http://192.168.1.1/x'), true)
+    assert.equal(isPrivateUrl('http://169.254.169.254/latest/meta-data/'), true)
+    assert.equal(isPrivateUrl('http://0.0.0.0/x'), true)
+  })
+
+  test('flags IPv6 loopback and link-local', () => {
+    assert.equal(isPrivateUrl('http://[::1]/x'), true)
+    assert.equal(isPrivateUrl('http://[fe80::1]/x'), true)
+  })
+
+  test('flags metadata hostnames', () => {
+    assert.equal(isPrivateUrl('http://metadata.google.internal/x'), true)
+  })
+
+  test('allows public hosts', () => {
+    assert.equal(isPrivateUrl('https://example.com/page'), false)
+    assert.equal(isPrivateUrl('https://api.tavily.com/search'), false)
+  })
+
+  test('executeWebFetch blocks a private URL before any request is made', async () => {
+    let fetchCalled = false
+    mock.method(globalThis, 'fetch', async () => {
+      fetchCalled = true
+      return new Response('{}', { status: 200 })
+    })
+    const result = await executeWebFetch(API_KEY, { urls: ['http://127.0.0.1/secret'] })
+    assert.equal(result.isError, true)
+    assert.match(result.content, /blocked: private\/loopback URL/)
+    assert.equal(fetchCalled, false, 'no outbound request must reach a private URL')
   })
 })

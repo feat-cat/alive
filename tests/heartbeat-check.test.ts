@@ -162,4 +162,40 @@ describe('GET /heartbeat-check', () => {
     assert.equal(body.ok, false)
     assert.match(body.error, /Store is not available/)
   })
+
+  test('H1: returns 401 without a Bearer header when ALIVE_AUTH_TOKEN is set', async () => {
+    const context = makeContext({ env: { ...(gatewayEnv() as Env), ALIVE_AUTH_TOKEN: 'secret' } })
+    const res = await heartbeatCheckOnRequest(context)
+    assert.equal(res.status, 401)
+    const body = (await res.json()) as { ok: boolean; error: string }
+    assert.equal(body.ok, false)
+    assert.equal(body.error, 'Unauthorized')
+  })
+
+  test('H1: returns 401 with a wrong Bearer token', async () => {
+    const context = makeContext({
+      env: { ...(gatewayEnv() as Env), ALIVE_AUTH_TOKEN: 'secret' },
+      headers: { authorization: 'Bearer wrong' },
+    })
+    const res = await heartbeatCheckOnRequest(context)
+    assert.equal(res.status, 401)
+  })
+
+  test('H1: returns 200 and runs the heartbeat with the correct Bearer token', async () => {
+    const store = makeMockStore({ [SELF_ID]: { [SELF_STATE_KEY]: defaultSelfState() } })
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    mockGateway(llmTextResponse('带鉴权的手动心跳。'))
+    const context = makeContext({
+      store,
+      env: { ...(gatewayEnv() as Env), ALIVE_AUTH_TOKEN: 'secret' },
+      headers: { authorization: 'Bearer secret' },
+    })
+
+    const res = await heartbeatCheckOnRequest(context)
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as { ok: boolean; text: string }
+    assert.equal(body.ok, true)
+    assert.match(body.text, /带鉴权的手动心跳/)
+  })
 })

@@ -205,7 +205,7 @@ export async function runHeartbeat(
   await ensureMemorySafe(context)
   const memory = await readMemorySafe(context)
   const persona = buildPersona({
-    nowText: humanNowText(new Date(), readTimeZone()),
+    nowText: humanNowText(new Date(), readTimeZone(context)),
     memoryContent: memory ? clampMemoryForContext(memory) : '',
   })
 

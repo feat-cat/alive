@@ -23,6 +23,7 @@ import {
   ensureWorkspace,
   editWorkspaceFiles,
   listWorkspaceFiles,
+  MAX_LIST_ITEMS,
   readWorkspaceFile,
   runWorkspaceCommand,
   workspaceRoot,
@@ -353,7 +354,7 @@ const WORKSPACE_TOOLS: Array<{
       try {
         const root = await ensureWorkspace(tc.context, tc.conversationId)
         const items = await listWorkspaceFiles(tc.context, tc.conversationId, root)
-        return { content: JSON.stringify({ root, items: items.slice(0, 200) }) }
+        return { content: JSON.stringify({ root, items: items.slice(0, MAX_LIST_ITEMS) }) }
       } catch (error) {
         return { content: error instanceof Error ? error.message : String(error), isError: true }
       }
@@ -427,7 +428,7 @@ const WORKSPACE_TOOLS: Array<{
         // overshoot the play timeout (abort checkpoints live in _llm/_tools).
         const boundedTimeout = clampTimeoutToDeadline(timeout, tc.deadlineAt)
         const root = await ensureWorkspace(tc.context, tc.conversationId)
-        const result = await runWorkspaceCommand(tc.context, tc.conversationId, root, command, boundedTimeout)
+        const result = await runWorkspaceCommand(tc.context, tc.conversationId, root, command, boundedTimeout, tc.signal)
         return { content: JSON.stringify(result) }
       } catch (error) {
         return { content: error instanceof Error ? error.message : String(error), isError: true }

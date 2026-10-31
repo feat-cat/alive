@@ -55,9 +55,10 @@ export const STORE_MESSAGE_LIMIT = 10_000
 /**
  * Requested recent-messages window for `getRecentMessages` (a narrow read helper;
  * the main history path is `loadMessages`). The actual page size is clamped to
- * `STORE_READ_LIMIT` (the platform `getMessages` limit is [1,100]).
+ * `STORE_READ_LIMIT` (the platform `getMessages` limit is [1,100]), so this
+ * default is set to that ceiling — a larger value would only be clamped anyway.
  */
-const RECENT_MESSAGES_DEFAULT_LIMIT = 2_000
+const RECENT_MESSAGES_DEFAULT_LIMIT = STORE_READ_LIMIT
 
 /** Usage below LOW never compacts; at HIGH it certainly should. */
 export const COMPACT_LOW_WATER = 0.5
@@ -576,21 +577,41 @@ export function formatDailyEntry(text: string, ts = nowIso()): string {
  * Append a timestamped entry to today's diary file. Same calendar day appends
  * to the same file; different days write different files. Returns the blob key.
  *
- * KNOWN LIMITATION: the read-modify-write here is NOT atomic. If the same
- * calendar day is appended to concurrently (the public /heartbeat endpoint can
- * be POSTed in parallel), one entry can be lost — the last writer wins. Under
- * the single-writer semantics (one hourly heartbeat) this is safe; a future
- * Blob-append primitive or a per-day lock would close the gap.
+ * In-process per-day serialization: a same-calendar-day append is a non-atomic
+ * read-modify-write on `memory/daily/YYYY-MM-DD.md`, so when /chat and
+ * /heartbeat write the SAME day file in parallel the plain path can drop an
+ * entry (last writer wins). Each day keeps its own promise tail — appends for
+ * one date run strictly in order, and a failed append is swallowed into the
+ * tail so the queue can never get stuck. This closes the gap inside a single
+ * Makers Functions instance; a future Blob-append primitive (or cross-instance
+ * locking) would extend the guarantee across instances.
  */
+const diaryAppendQueues = new Map<string, Promise<unknown>>()
+
 export async function appendDailyLog(context: MakersContext, text: string, at: Date = new Date()): Promise<string> {
-  const store = await getBlobStore()
   const key = dailyBlobKey(at)
-  const existing = (await store.get(key)) as string | null
   const entry = formatDailyEntry(text)
   if (!entry) return key
-  const content = existing && existing.trim() ? existing + entry : entry.trimStart()
-  await store.set(key, content)
-  return key
+  const day = dateKey(at)
+
+  const run = async (): Promise<string> => {
+    const store = await getBlobStore()
+    const existing = (await store.get(key)) as string | null
+    const content = existing && existing.trim() ? existing + entry : entry.trimStart()
+    await store.set(key, content)
+    return key
+  }
+  // M1: serialize same-day appends per process so a read-modify-write can never
+  // interleave and drop an entry (cross-instance still last-writer-wins — see
+  // the KNOWN LIMITATION note above).
+  const previous = diaryAppendQueues.get(day) ?? Promise.resolve()
+  const ran = previous.then(run, run)
+  const tail = ran.catch(() => undefined)
+  diaryAppendQueues.set(day, tail)
+  void tail.then(() => {
+    if (diaryAppendQueues.get(day) === tail) diaryAppendQueues.delete(day)
+  })
+  return ran
 }
 
 /**

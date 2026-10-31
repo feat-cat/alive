@@ -119,6 +119,12 @@ describe('parseMcpServers', () => {
     assert.equal(configs[0].name, 'gh.example')
     assert.equal(configs[0].url, 'https://gh.example')
   })
+
+  test('H3: rejects plain http: URLs (SSRF guard), keeps https:', () => {
+    const configs = parseMcpServers('https://a.test/mcp,http://internal.local/mcp,http://127.0.0.1:8080/mcp')
+    assert.equal(configs.length, 1)
+    assert.equal(configs[0].url, 'https://a.test/mcp')
+  })
 })
 
 describe('discoverMcpClients', () => {

@@ -312,7 +312,7 @@ export async function runChat(
   // reading MEMORY.md is best-effort so a Blob-less first turn still works.
   const memory = await readMemoryWithSeedSafe(context)
   const persona = buildPersona({
-    nowText: humanNowText(new Date(), readTimeZone()),
+    nowText: humanNowText(new Date(), readTimeZone(context)),
     memoryContent: memory ? clampMemoryForContext(memory) : '',
   })
 
@@ -325,7 +325,14 @@ export async function runChat(
   // the internal signal and surfaces CHAT_TIMEOUT_MESSAGE instead of a silent
   // client-style abort.
   const budget = createTurnBudget(signal, timeoutMs)
-  const tools = await buildToolsAsync({ context, conversationId, signal: budget.signal })
+  const tools = await buildToolsAsync({
+    context,
+    conversationId,
+    signal: budget.signal,
+    // C1: bound the workspace commands to this turn's wall-clock budget too,
+    // matching the heartbeat path (a long build must never overshoot the turn).
+    deadlineAt: Date.now() + (timeoutMs ?? CHAT_TURN_TIMEOUT_MS),
+  })
   const baseMessages: LlmMessage[] = [
     { role: 'system', content: `${persona}\n\n${CHAT_CONVERSATION_MODE}\n\n${SYSTEM_HISTORY_GUIDANCE}` },
     ...history,
@@ -505,7 +512,7 @@ async function* chatStreamGenerator(
 
   const memory = await readMemoryWithSeedSafe(context)
   const persona = buildPersona({
-    nowText: humanNowText(new Date(), readTimeZone()),
+    nowText: humanNowText(new Date(), readTimeZone(context)),
     memoryContent: memory ? clampMemoryForContext(memory) : '',
   })
   const history = await loadMessages(context, conversationId)
@@ -517,7 +524,13 @@ async function* chatStreamGenerator(
   // request signal so a tool-heavy streaming loop cannot run forever; on
   // expiry the descriptive CHAT_TIMEOUT_MESSAGE error replaces a silent abort.
   const budget = createTurnBudget(signal, timeoutMs)
-  const tools = await buildToolsAsync({ context, conversationId, signal: budget.signal })
+  const tools = await buildToolsAsync({
+    context,
+    conversationId,
+    signal: budget.signal,
+    // C1: bound workspace commands to this turn's wall-clock budget.
+    deadlineAt: Date.now() + (timeoutMs ?? CHAT_TURN_TIMEOUT_MS),
+  })
   // Feature ②: mark the turn active (queued interrupts join the next LLM request).
   await setActiveTurn(context, conversationId, activeTurnMarker())
 

@@ -9,6 +9,8 @@
  * template.
  */
 
+import type { MakersContext } from './_shared.ts'
+
 export interface PersonaInput {
   /** Human-readable current wall-clock, e.g. "2026-09-18 星期五 14:30". */
   nowText: string
@@ -31,14 +33,17 @@ function localNowText(at: Date): string {
 }
 
 /**
- * Read the optional IANA timezone from `ALIVE_TZ` (e.g. `Asia/Shanghai`). The
- * value is trimmed; unset / empty / whitespace-only returns `undefined` (the
- * caller then falls back to the function-local wall clock). Invalid IANA names
- * are NOT rejected here — `Intl.DateTimeFormat` throws on them and
- * `humanNowText` catches that and falls back to local time.
+ * Read the optional IANA timezone from `context.env.ALIVE_TZ` (e.g.
+ * `Asia/Shanghai`). The value is trimmed; unset / empty / whitespace-only
+ * returns `undefined` (the caller then falls back to the function-local wall
+ * clock). Invalid IANA names are NOT rejected here — `Intl.DateTimeFormat`
+ * throws on them and `humanNowText` catches that and falls back to local time.
+ *
+ * M3: read from the platform-injected `context.env` (never `process.env`) so
+ * the config path matches every other setting (`envString`).
  */
-export function readTimeZone(): string | undefined {
-  const value = process.env.ALIVE_TZ?.trim()
+export function readTimeZone(context: MakersContext): string | undefined {
+  const value = context.env?.ALIVE_TZ?.trim()
   return value ? value : undefined
 }
 

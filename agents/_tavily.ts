@@ -24,6 +24,122 @@ const SEARCH_DEPTHS = ['basic', 'advanced'] as const
 const SEARCH_TOPICS = ['general', 'news'] as const
 const TIME_RANGES = ['day', 'week', 'month', 'year'] as const
 
+/* ------------------------------------------------------------------ */
+/* Lightweight retry for transient Tavily failures (429 / 5xx / net)   */
+/* ------------------------------------------------------------------ */
+
+/** Maximum retries for a single Tavily request (one attempt + up to 2 retries). */
+export const TAVILY_RETRY_MAX = 2
+
+/** Fixed backoff schedule (ms) between retries, indexed by the retry ordinal. */
+export const TAVILY_RETRY_BACKOFF_MS = [500, 1000] as const
+
+/** Test seam: replace the active backoff (e.g. `[0, 0]`) so the suite never sleeps. */
+let activeTavilyBackoff: readonly number[] = TAVILY_RETRY_BACKOFF_MS
+
+export function setTavilyRetryForTesting(backoffMs: readonly number[] | null): void {
+  activeTavilyBackoff = backoffMs ?? TAVILY_RETRY_BACKOFF_MS
+}
+
+/** True when an HTTP status is worth retrying (transient). 400/401/403 never retry. */
+function isRetryableTavilyStatus(status: number): boolean {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504
+}
+
+/** True when a network-layer fetch error (TypeError) is worth retrying. */
+function isRetryableNetworkError(error: unknown): boolean {
+  if (error instanceof Error && error.name === 'AbortError') return false
+  return error instanceof TypeError
+}
+
+async function waitForTavilyRetry(ms: number): Promise<void> {
+  if (ms <= 0) return
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+/**
+ * Run a single fetch attempt with a per-attempt wall-clock timeout, retrying
+ * transient failures (429/5xx/network TypeError) up to `TAVILY_RETRY_MAX` times
+ * with the configured backoff. Non-retryable statuses (400/401/403/…) return
+ * immediately. On retryable exhaustion the last thrown error is rethrown.
+ */
+async function tavilyFetch(url: string, init: RequestInit): Promise<Response> {
+  let lastError: unknown = null
+  for (let attemptIndex = 0; ; attemptIndex += 1) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+    try {
+      const response = await fetch(url, { ...init, signal: controller.signal })
+      if (response.ok || !isRetryableTavilyStatus(response.status) || attemptIndex >= TAVILY_RETRY_MAX) {
+        return response
+      }
+      lastError = new Error(`Tavily HTTP ${response.status}`)
+    } catch (error) {
+      // A per-attempt timeout aborts with an AbortError — surface it immediately
+      // (not retried); a genuine network TypeError is retried.
+      if (error instanceof Error && error.name === 'AbortError') throw error
+      if (!isRetryableNetworkError(error) || attemptIndex >= TAVILY_RETRY_MAX) throw error
+      lastError = error
+    } finally {
+      clearTimeout(timer)
+    }
+    const delay = activeTavilyBackoff[attemptIndex] ?? activeTavilyBackoff[activeTavilyBackoff.length - 1] ?? 0
+    await waitForTavilyRetry(delay)
+  }
+}
+
+/**
+ * Private / loopback / metadata hostnames that must never be reached by an
+ * outbound fetch (SSRF guard). A URL whose host resolves to any of these is
+ * rejected before any request is made.
+ */
+const PRIVATE_HOSTNAMES = new Set([
+  'localhost',
+  'metadata.google.internal',
+  'metadata.googleapis.com',
+  '169.254.169.254',
+  '0.0.0.0',
+])
+
+/**
+ * True when `url` targets a private / loopback / link-local / metadata network.
+ * Resolves the host to an IP literal and checks every range a public-only fetch
+ * must never hit. Invalid URLs return true (they can never be fetched safely).
+ */
+export function isPrivateUrl(url: string): boolean {
+  let host: string
+  try {
+    host = new URL(url).hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  } catch {
+    return true
+  }
+  // Exact known-bad hostnames.
+  if (PRIVATE_HOSTNAMES.has(host)) return true
+  // IPv6 loopback / unspecified.
+  if (host === '::1' || host === '::' || host === '0:0:0:0:0:0:0:1') return true
+  // IPv6 link-local (fe80::/10).
+  if (/^fe80:/i.test(host)) return true
+  // IPv6 unique-local (fc00::/7).
+  if (/^f[cd][0-9a-f]{2}:/i.test(host)) return true
+  // Numeric IPv4 ranges (127/8 loopback, 10/8, 172.16/12, 192.168/16,
+  // 169.254/16 link-local, 0/8).
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
+  if (v4) {
+    const a = Number(v4[1])
+    const b = Number(v4[2])
+    if (a === 127 || a === 10 || a === 0) return true
+    if (a === 172 && b >= 16 && b <= 31) return true
+    if (a === 192 && b === 168) return true
+    if (a === 169 && b === 254) return true
+  }
+  // Hostnames are otherwise treated as public (DNS could point anywhere, but a
+  // remote resolver will re-check on connect; blocking unknown names outright
+  // would break legitimate public hosts).
+  return false
+}
+
 interface TavilySearchResponse {
   results?: Array<{
     title?: string
@@ -188,26 +304,22 @@ export async function executeWebSearch(apiKey: string, args: Record<string, unkn
     if (excludeDomains.list !== undefined) body.exclude_domains = excludeDomains.list
     if (args.include_images !== undefined) body.include_images = includeImages
 
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
     let response: Response
     try {
-      response = await fetch(TAVILY_SEARCH_URL, {
+      response = await tavilyFetch(TAVILY_SEARCH_URL, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${key}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
-        signal: controller.signal,
       })
     } catch (error) {
-      const message = controller.signal.aborted
+      const isTimeout = error instanceof Error && error.name === 'AbortError'
+      const message = isTimeout
         ? `Web search failed: request to the search backend timed out after ${REQUEST_TIMEOUT_MS / 1000}s.`
         : `Web search failed: ${error instanceof Error ? error.message : String(error)}`
       return { content: message, isError: true }
-    } finally {
-      clearTimeout(timer)
     }
 
     if (!response.ok) {
@@ -239,6 +351,12 @@ export async function executeWebFetch(apiKey: string, args: Record<string, unkno
     if (urls.length > MAX_URLS) {
       return { content: `Tool "web_fetch" requires at most ${MAX_URLS} urls (got ${urls.length}).`, isError: true }
     }
+    // H3 (SSRF guard): refuse any private / loopback / link-local / metadata
+    // URL so web_fetch can never be used to poke the internal network.
+    const blocked = urls.find((u) => isPrivateUrl(u))
+    if (blocked) {
+      return { content: 'blocked: private/loopback URL', isError: true }
+    }
 
     let maxChars = DEFAULT_MAX_CHARS
     if (args.max_chars !== undefined) {
@@ -261,26 +379,22 @@ export async function executeWebFetch(apiKey: string, args: Record<string, unkno
 
     const body: Record<string, unknown> = { urls: urls.map((url) => url.trim()), max_chars: maxChars }
 
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
     let response: Response
     try {
-      response = await fetch(TAVILY_EXTRACT_URL, {
+      response = await tavilyFetch(TAVILY_EXTRACT_URL, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${key}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
-        signal: controller.signal,
       })
     } catch (error) {
-      const message = controller.signal.aborted
+      const isTimeout = error instanceof Error && error.name === 'AbortError'
+      const message = isTimeout
         ? `Web fetch failed: request to the extract backend timed out after ${REQUEST_TIMEOUT_MS / 1000}s.`
         : `Web fetch failed: ${error instanceof Error ? error.message : String(error)}`
       return { content: message, isError: true }
-    } finally {
-      clearTimeout(timer)
     }
 
     if (!response.ok) {

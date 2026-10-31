@@ -5,6 +5,7 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildPersona, humanNowText, readTimeZone, type PersonaInput } from '../agents/_persona.ts'
+import { makeContext } from './_helpers.ts'
 
 describe('buildPersona', () => {
   const base: PersonaInput = {
@@ -82,27 +83,13 @@ describe('humanNowText', () => {
 })
 
 describe('readTimeZone', () => {
-  test('returns the trimmed ALIVE_TZ value when set', () => {
-    const previous = process.env.ALIVE_TZ
-    try {
-      process.env.ALIVE_TZ = '  Asia/Shanghai  '
-      assert.equal(readTimeZone(), 'Asia/Shanghai')
-    } finally {
-      if (previous === undefined) delete process.env.ALIVE_TZ
-      else process.env.ALIVE_TZ = previous
-    }
+  test('returns the trimmed ALIVE_TZ value from context.env when set', () => {
+    const ctx = makeContext({ env: { ALIVE_TZ: '  Asia/Shanghai  ' } })
+    assert.equal(readTimeZone(ctx), 'Asia/Shanghai')
   })
 
   test('returns undefined when ALIVE_TZ is unset or whitespace-only', () => {
-    const previous = process.env.ALIVE_TZ
-    try {
-      delete process.env.ALIVE_TZ
-      assert.equal(readTimeZone(), undefined)
-      process.env.ALIVE_TZ = '   '
-      assert.equal(readTimeZone(), undefined)
-    } finally {
-      if (previous === undefined) delete process.env.ALIVE_TZ
-      else process.env.ALIVE_TZ = previous
-    }
+    assert.equal(readTimeZone(makeContext({ env: {} })), undefined)
+    assert.equal(readTimeZone(makeContext({ env: { ALIVE_TZ: '   ' } })), undefined)
   })
 })

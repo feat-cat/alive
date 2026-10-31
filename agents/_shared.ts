@@ -136,7 +136,7 @@ export interface SandboxCommandResult {
 
 export interface SandboxLike {
   commands: {
-    run(cmd: string, opts?: { cwd?: string; timeout?: number }): Promise<SandboxCommandResult>
+    run(cmd: string, opts?: { cwd?: string; timeout?: number; signal?: AbortSignal }): Promise<SandboxCommandResult>
   }
   files: {
     read(path: string): Promise<unknown>

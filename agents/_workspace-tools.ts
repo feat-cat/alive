@@ -25,7 +25,8 @@ const IGNORED_DIRECTORIES = new Set([
 const IGNORED_FILES = new Set(['.DS_Store', 'preview'])
 
 const TEXT_PREVIEW_LIMIT = 256 * 1024
-const MAX_LIST_ITEMS = 400
+/** Max items surfaced by a single workspace listing (list + the tool output). */
+export const MAX_LIST_ITEMS = 400
 const COMMAND_OUTPUT_LIMIT = 20_000
 
 export interface WorkspaceItem {
@@ -207,11 +208,22 @@ export async function editWorkspaceFiles(context: MakersContext, conversationId:
   return { summary: flattened, text: result.text }
 }
 
-export async function runWorkspaceCommand(context: MakersContext, conversationId: string, root: string, command: string, timeout = 60): Promise<{ command: string; stdout: string; stderr: string; exitCode: number }> {
+export async function runWorkspaceCommand(
+  context: MakersContext,
+  conversationId: string,
+  root: string,
+  command: string,
+  timeout = 60,
+  signal?: AbortSignal,
+): Promise<{ command: string; stdout: string; stderr: string; exitCode: number }> {
   if (!command.trim()) throw new Error('Command must not be empty.')
   const sandbox = requireSandbox(context)
   const safeTimeout = Math.min(Math.max(Math.round(timeout), 1), 300)
-  const result = await sandbox.commands.run(command, { cwd: root, timeout: safeTimeout })
+  // C1: the caller's turn-level signal is threaded into the sandbox run so a
+  // wall-clock deadline / client abort also stops a long command, and the
+  // timeout is already clamped upstream (`clampTimeoutToDeadline`) to the
+  // remaining turn budget. Pass both through so the sandbox honours them.
+  const result = await sandbox.commands.run(command, { cwd: root, timeout: safeTimeout, signal })
   return {
     command,
     stdout: clampText(String(result.stdout ?? ''), COMMAND_OUTPUT_LIMIT),

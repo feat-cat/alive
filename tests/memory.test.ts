@@ -286,6 +286,27 @@ describe('appendDailyLog', () => {
     assert.match(blob.blobMap.get('memory/daily/2026-09-10.md') ?? '', /- \[\d{4}-\d{2}-\d{2}T/)
     assert.match(blob.blobMap.get('memory/daily/2026-09-11.md') ?? '', /- \[\d{4}-\d{2}-\d{2}T/)
   })
+
+  test('M1: concurrent same-day appends are serialized per process (no entry lost)', async () => {
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    const context = makeContext({})
+    const at = new Date(2026, 8, 11, 12, 0, 0)
+
+    // Fire many appends for the SAME day without awaiting between them — the
+    // per-day promise chain must serialize the read-modify-writes so every entry
+    // survives (a naive parallel RMW would drop most of them).
+    const entries = Array.from({ length: 25 }, (_, i) => `条目-${i + 1}`)
+    await Promise.all(entries.map((text) => appendDailyLog(context, text, at)))
+
+    const content = blob.blobMap.get('memory/daily/2026-09-11.md') ?? ''
+    for (const entry of entries) {
+      assert.ok(content.includes(entry), `missing serialized entry: ${entry}`)
+    }
+    // One file, containing all 25 entries.
+    assert.match(content, /条目-1/)
+    assert.match(content, /条目-25/)
+  })
 })
 
 describe('diary_append (registered in buildTools)', () => {
