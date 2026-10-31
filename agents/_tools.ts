@@ -58,6 +58,37 @@ export interface ToolContext {
   onWorkspaceTool?: (name: string) => void
 }
 
+/**
+ * Result of one tool execution. `declined` / `declineReason` are set ONLY by
+ * `decline_response` — the LLM loop reads them to end the turn without text.
+ */
+export interface ToolResult {
+  content: string
+  isError?: boolean
+  declined?: boolean
+  declineReason?: string
+}
+
+/** One registry entry: `run` returns a `ToolResult` (decline-aware). */
+type ToolEntry = {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+  run: (tc: ToolContext, args: Record<string, unknown>) => Promise<ToolResult>
+}
+
+/**
+ * Human-readable declined-row content. With a reason it is included (clamped to
+ * ~100 chars); without, the plain "不回应" marker is used. This is the ONLY
+ * legal "no text output" exit of a turn.
+ */
+export function formatDeclinedContent(reason?: string): string {
+  const trimmed = reason?.trim() ?? ''
+  if (!trimmed) return '（选择不回应）'
+  const clamped = trimmed.length > 100 ? trimmed.slice(0, 100) : trimmed
+  return `（选择不回应：${clamped}）`
+}
+
 /** Clamp a requested tool timeout (seconds) to the remaining turn budget. */
 function clampTimeoutToDeadline(requestedSeconds: number, deadlineAt: number | undefined): number {
   const clamped = Math.min(Math.max(Math.round(requestedSeconds), 1), 300)
@@ -419,7 +450,7 @@ const SEARCH_TOOL: { name: string; description: string; parameters: Record<strin
   run: (tc, args) => executeWebSearch(envString(tc.context, 'TAVILY_API_KEY'), args),
 }
 
-const FETCH_TOOL: { name: string; description: string; parameters: Record<string, unknown>; run: (tc: ToolContext, args: Record<string, unknown>) => Promise<{ content: string; isError?: boolean }> } = {
+const FETCH_TOOL: ToolEntry = {
   name: 'web_fetch',
   description: '抓取网页正文内容（Tavily extract），输入 url 列表，返回每页标题+正文片段。需要 TAVILY_API_KEY。适合需要网页正文/特定页面的场景；web_search 适合找链接列表。',
   parameters: {
@@ -429,6 +460,27 @@ const FETCH_TOOL: { name: string; description: string; parameters: Record<string
   run: (tc, args) => executeWebFetch(envString(tc.context, 'TAVILY_API_KEY'), args),
 }
 
+/**
+ * `decline_response`: the model's explicit "I choose not to answer" exit. The
+ * tool returns `declined: true` so the LLM loop ends the turn immediately with
+ * no assistant text, persists a `kind:'declined'` history row, and (in chat)
+ * emits a `declined` SSE event instead of an error. The loop never reaches the
+ * forced-text last turn when this fires (tools are withheld there, so the model
+ * MUST answer in words on the final round — decline is only legal mid-turn).
+ */
+const DECLINE_TOOL: ToolEntry = {
+  name: 'decline_response',
+  description:
+    '当你判断用户无需回应、或你不应/不能回应（超出能力、敏感、不适合）时调用；调用后本轮立即结束，不产出文字。正常对话必须回复，不要滥用。',
+  parameters: {
+    reason: optionalString('可选的原因说明（≤100 字），会写进上下文让 AI 下次记得为什么拒绝'),
+  },
+  run: async (_tc, args) => {
+    const reason = typeof args.reason === 'string' ? args.reason.trim().slice(0, 100) : ''
+    return { content: '已选择不回应，本轮结束。', declined: true, declineReason: reason }
+  },
+}
+
 export interface ToolRegistry {
   definitions: LlmToolDef[]
   run: ToolRunner
@@ -436,7 +488,15 @@ export interface ToolRegistry {
 
 /** Build the full registry for a request (e.g. a heartbeat turn). */
 export function buildTools(tc: ToolContext): ToolRegistry {
-  const entries = [...BLOB_TOOLS, ...WORKSPACE_TOOLS, ...DIARY_TOOLS, ...CHATLOG_TOOLS, SEARCH_TOOL, FETCH_TOOL]
+  const entries: ToolEntry[] = [
+    ...BLOB_TOOLS,
+    ...WORKSPACE_TOOLS,
+    ...DIARY_TOOLS,
+    ...CHATLOG_TOOLS,
+    SEARCH_TOOL,
+    FETCH_TOOL,
+    DECLINE_TOOL,
+  ]
   const definitions: LlmToolDef[] = entries.map((entry) => ({
     name: entry.name,
     description: entry.description,

@@ -384,3 +384,33 @@ export function clampText(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text
   return `${text.slice(0, maxChars)}…[truncated]`
 }
+
+/**
+ * Levenshtein edit distance between two strings (number of single-character
+ * insertions/deletions/substitutions to turn `a` into `b`). Pure, DP-based,
+ * O(min(a,b)) memory via two rolling rows. Used by chat's user-message merge
+ * detection (a typo-fixed resend differs by a tiny distance).
+ */
+export function levenshtein(a: string, b: string): number {
+  if (a === b) return 0
+  if (a.length === 0) return b.length
+  if (b.length === 0) return a.length
+  // Keep the shorter string as the column dimension for O(min) memory.
+  const left = a.length <= b.length ? a : b
+  const right = a.length <= b.length ? b : a
+  let prev = new Array<number>(right.length + 1)
+  let curr = new Array<number>(right.length + 1)
+  for (let j = 0; j <= right.length; j += 1) prev[j] = j
+  for (let i = 1; i <= left.length; i += 1) {
+    curr[0] = i
+    const leftChar = left[i - 1]
+    for (let j = 1; j <= right.length; j += 1) {
+      const cost = leftChar === right[j - 1] ? 0 : 1
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+    }
+    const swap = prev
+    prev = curr
+    curr = swap
+  }
+  return prev[right.length]
+}

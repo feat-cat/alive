@@ -34,12 +34,13 @@
 import {
   clampText,
   nowIso,
+  safeSegment,
   STORE_READ_LIMIT,
   type MakersContext,
   type StoreMessage,
 } from './_shared.ts'
 import { chatCompletion, stripImageContent, type LlmContent, type LlmContentPart, type LlmMessage, type ToolRunRecord } from './_llm.ts'
-import { getBlobStore } from './_blob-tools.ts'
+import { getBlobStore, type BlobStore } from './_blob-tools.ts'
 
 const LOG_ROLE = 'assistant'
 const LOG_METADATA_KIND = 'agent-log'
@@ -1204,4 +1205,152 @@ export async function appendMemoryNote(context: MakersContext, text: string, at:
 /** Clamp MEMORY.md for persona/context injection. */
 export function clampMemoryForContext(content: string): string {
   return clampText(content, MEMORY_CONTEXT_CLAMP)
+}
+
+/* ------------------------------------------------------------------ */
+/* Turn-active flag + interrupt message queue (Blob, strong-consistent) */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Active-turn marker: a single AI turn (chat OR heartbeat) may issue MANY LLM
+ * requests (multi-round tool thinking). While the marker is present, a new user
+ * message that is NOT a merge is QUEUED instead of starting a competing turn —
+ * it is folded into the next LLM request of the running turn. Stored as a
+ * strong-consistent Blob JSON so multiple serverless instances agree.
+ */
+export interface ActiveTurn {
+  startedAt: number
+  expiresAt: number
+}
+
+/** One queued interrupt message (the user's un-answered text). */
+export interface QueueMessage {
+  text: string
+  ts: string
+}
+
+/** Blob key of the per-conversation active-turn marker. */
+export function activeTurnBlobKey(conversationId: string): string {
+  return `memory/turn-active-${safeSegment(conversationId)}.json`
+}
+
+/** Blob key of the per-conversation interrupt queue (JSON array). */
+export function queueBlobKey(conversationId: string): string {
+  return `memory/queue-${safeSegment(conversationId)}.json`
+}
+
+/**
+ * Mark the start of an AI turn (cleared by `clearActiveTurn` in a finally).
+ * Best-effort: a Blob failure degrades silently so an autonomous turn is never
+ * blocked by the (optional) interrupt-queue machinery.
+ */
+export async function setActiveTurn(context: MakersContext, conversationId: string, turn: ActiveTurn): Promise<void> {
+  try {
+    const store = await getBlobStore()
+    await store.setJSON(activeTurnBlobKey(conversationId), turn)
+  } catch {
+    /* best-effort: without the marker interrupts simply start new turns */
+  }
+}
+
+/**
+ * Clear the active-turn marker at the end of an AI turn (idempotent).
+ * Best-effort: a Blob failure never crashes the turn teardown.
+ */
+export async function clearActiveTurn(context: MakersContext, conversationId: string): Promise<void> {
+  try {
+    const store = await getBlobStore()
+    await store.delete(activeTurnBlobKey(conversationId))
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Read the active-turn marker, or null when none / expired / Blob unavailable.
+ * An expired marker is treated as absent (the old turn has effectively ended)
+ * and is NOT cleared here — the owning turn's finally will clear it, or the next
+ * turn overwrites.
+ */
+export async function getActiveTurn(context: MakersContext, conversationId: string): Promise<ActiveTurn | null> {
+  try {
+    const store = await getBlobStore()
+    const raw = (await store.get(activeTurnBlobKey(conversationId))) as string | null
+    if (typeof raw !== 'string' || !raw.trim()) return null
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const record = parsed as Record<string, unknown>
+    const startedAt = typeof record.startedAt === 'number' ? record.startedAt : Number(record.startedAt)
+    const expiresAt = typeof record.expiresAt === 'number' ? record.expiresAt : Number(record.expiresAt)
+    if (!Number.isFinite(startedAt) || !Number.isFinite(expiresAt)) return null
+    if (Date.now() > expiresAt) return null
+    return { startedAt, expiresAt }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Append one user message to the per-conversation interrupt queue. Non-atomic
+ * read-modify-write (the platform offers no Blob-append primitive for JSON);
+ * an occasional lost write under true concurrency is accepted per design.
+ * Returns false when the queue could not be written (Blob failure) — the caller
+ * then falls back to starting a new turn so the message is never dropped.
+ */
+export async function enqueueMessage(context: MakersContext, conversationId: string, text: string): Promise<boolean> {
+  try {
+    const store = await getBlobStore()
+    const key = queueBlobKey(conversationId)
+    const items = await readQueueItems(store, key)
+    items.push({ text, ts: nowIso() })
+    await store.setJSON(key, items)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Read the interrupt queue for a conversation and, when non-empty, persist its
+ * messages as real `user` history rows (so the AI context stays consistent) and
+ * return them as model messages to append to the running LLM request. The queue
+ * is cleared after consumption. Returns [] when the queue is empty / unreadable /
+ * Blob unavailable.
+ */
+export async function drainQueue(context: MakersContext, conversationId: string): Promise<LlmMessage[]> {
+  try {
+    const store = await getBlobStore()
+    const key = queueBlobKey(conversationId)
+    const items = await readQueueItems(store, key)
+    if (items.length === 0) return []
+    const drained: LlmMessage[] = []
+    for (const item of items) {
+      const text = typeof item?.text === 'string' ? item.text.trim() : ''
+      if (!text) continue
+      // Persist FIRST so a mid-way failure never loses a queued message; the
+      // queue is only consumed once every item reached the store.
+      await persistHistory(context, conversationId, 'user', text, { kind: 'user' })
+      drained.push({ role: 'user', content: text })
+    }
+    await store.delete(key)
+    return drained
+  } catch {
+    return []
+  }
+}
+
+/** Parse the queue JSON array (defensive: any corruption degrades to []). */
+async function readQueueItems(store: BlobStore, key: string): Promise<QueueMessage[]> {
+  const raw = (await store.get(key)) as string | null
+  if (typeof raw !== 'string' || !raw.trim()) return []
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(
+      (item): item is QueueMessage =>
+        !!item && typeof item === 'object' && typeof (item as QueueMessage).text === 'string',
+    )
+  } catch {
+    return []
+  }
 }

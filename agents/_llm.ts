@@ -219,7 +219,7 @@ export interface ToolRunner {
     name: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
-  ): Promise<{ content: string; isError?: boolean }>
+  ): Promise<{ content: string; isError?: boolean; declined?: boolean; declineReason?: string }>
 }
 
 export interface ChatOptions {
@@ -240,6 +240,13 @@ export interface ChatOptions {
    * heartbeat/compact (which only need the final text) keep their exact output.
    */
   accumulateText?: boolean
+  /**
+   * Called immediately before EVERY LLM request in the turn loop (including the
+   * first). Returns additional messages to append to the working array — used by
+   * chat/heartbeat to fold interrupt-queue user messages into the running turn.
+   * Returns [] when there is nothing to drain.
+   */
+  drainMessages?: (messages: LlmMessage[]) => Promise<LlmMessage[]>
 }
 
 /**
@@ -275,6 +282,15 @@ export interface ChatResult {
    * plus tool records tagged with their round.
    */
   turnRecords: ChatTurnArchive[]
+  /**
+   * True when the turn ended because the model called `decline_response`:
+   * no assistant text was produced, `text` is `''`, and `declinedContent` holds
+   * the context row to persist (e.g. `（选择不回应：原因）`). The caller decides
+   * how to archive it (store row + chatlog) — `_llm` itself never touches the store.
+   */
+  declined?: boolean
+  /** Content for the persisted `kind:'declined'` history row (set when declined). */
+  declinedContent?: string
 }
 
 /** Neutral reply for a tool-only turn whose context budget forces an early close (same wording as the streaming chat path). */
@@ -718,6 +734,13 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
   while (turns < maxTurns) {
     if (signal?.aborted) throwAbort()
     turns += 1
+    // Fold interrupt-queue user messages into this LLM request (feature ②).
+    // The queue is drained here (before EVERY request) so a message that arrived
+    // mid-turn joins the next thinking round instead of starting a competing turn.
+    if (options.drainMessages) {
+      const drained = await options.drainMessages(current)
+      if (drained.length > 0) current.push(...drained)
+    }
     // Last round: tools are withheld so the model MUST answer in words — it
     // can't end the conversation with a tool call.
     const roundTools = turns >= maxTurns ? [] : tools
@@ -773,10 +796,36 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
       // execution, not just the LLM fetch (play's 100s controller signal).
       if (signal?.aborted) throwAbort()
       const args = safeParseArguments(call.arguments)
-      const result = await toolRunner(call.name, args, signal).catch((error: unknown) => ({
+      const result = await toolRunner(call.name, args, signal).catch((error: unknown): {
+        content: string
+        isError: boolean
+        declined?: boolean
+        declineReason?: string
+      } => ({
         content: error instanceof Error ? `Tool error: ${error.message}` : `Tool error: ${String(error)}`,
         isError: true,
       }))
+      // decline_response (feature ③): end the turn NOW, no assistant text. The
+      // caller persists the declined context row + chatlog record; _llm never
+      // touches the store. The remaining tool calls of this round are NOT run.
+      if (result.declined) {
+        turnRecords.push({
+          turn: turns,
+          text: content,
+          reasoning: reasoning.trim() || undefined,
+          toolResults: roundResults,
+        })
+        const reasoningAll = reasoningParts.join('')
+        return {
+          text: '',
+          turns,
+          toolResults,
+          reasoning: reasoningAll,
+          turnRecords,
+          declined: true,
+          declinedContent: result.declineReason,
+        }
+      }
       const text = clampForModel(result.content)
       const run: ToolRunRecord = {
         name: call.name,

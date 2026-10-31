@@ -30,22 +30,26 @@ import {
   type MakersContext,
 } from './_shared.ts'
 import { chatCompletion, type ChatResult } from './_llm.ts'
-import { CHAT_CONVERSATION_MODE } from './chat.ts'
+import { CHAT_CONVERSATION_MODE, TURN_ACTIVE_MS } from './chat.ts'
 import { buildPersona, humanNowText, readTimeZone } from './_persona.ts'
 import { getState, updateState, type AgentState } from './_state.ts'
 import {
   appendDailyLog,
   appendLog,
   clampMemoryForContext,
+  clearActiveTurn,
+  drainQueue,
   ensureMemorySeed,
   loadMessages,
   maybeCompact,
   persistHistory,
   readMemoryFile,
   recordToolCalls,
+  setActiveTurn,
   SYSTEM_HISTORY_GUIDANCE,
+  type ActiveTurn,
 } from './_memory.ts'
-import { buildTools } from './_tools.ts'
+import { buildTools, formatDeclinedContent } from './_tools.ts'
 import { snapshotWorkspaceToBlob, workspaceRoot } from './_workspace-tools.ts'
 
 /**
@@ -238,6 +242,10 @@ export async function runHeartbeat(
   })
 
   let result: ChatResult
+  // Feature ②: mark the turn active so a concurrent user chat message queues
+  // instead of forking a competing turn (cleared in the finally below).
+  const activeMarker: ActiveTurn = { startedAt: Date.now(), expiresAt: Date.now() + TURN_ACTIVE_MS }
+  await setActiveTurn(context, conversationId, activeMarker)
   try {
     result = await chatCompletion({
       context,
@@ -255,6 +263,8 @@ export async function runHeartbeat(
       signal: controller.signal,
       temperature: 0.8,
       maxTokens: 800,
+      // Feature ②: fold interrupt-queue user messages into the next LLM request.
+      drainMessages: async () => drainQueue(context, conversationId),
     })
   } catch (error) {
     // Best-effort: workspace file writes are mirrored to Blob as they happen,
@@ -269,6 +279,7 @@ export async function runHeartbeat(
   } finally {
     clearTimeout(timer)
     options.signal?.removeEventListener('abort', onAbort)
+    await clearActiveTurn(context, conversationId)
   }
 
   const text = result.text.trim()
@@ -289,6 +300,23 @@ export async function runHeartbeat(
   // Tool calls happened inside the loop, so persist them into the history
   // BEFORE the final assistant reply (the reply is the last store entry).
   await recordToolCalls(context, conversationId, result.toolResults)
+
+  // Feature ③: the model declined — end the turn silently (no diary/log), but
+  // record the declined context row so later turns see "这个我拒绝过".
+  if (result.declined) {
+    await persistHistory(context, conversationId, 'assistant', formatDeclinedContent(result.declinedContent), {
+      kind: 'declined',
+      metadata: { kind: 'declined' },
+    })
+    return {
+      text: '',
+      turns: result.turns,
+      toolCount,
+      touchedSandbox,
+      savedFiles,
+      now: nowIso(),
+    }
+  }
 
   // P3-9: distinguish "the tools ran but no final words came out" (usually a
   // budget/timeout-shaped close) from "nothing was even thought" — the latter

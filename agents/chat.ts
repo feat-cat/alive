@@ -39,18 +39,21 @@ import {
   CHAT_TIMEOUT_MESSAGE,
   MAX_TOOLS_PER_TURN,
   SELF_ID,
+  STORE_READ_LIMIT,
   TOOL_RESULT_CONTEXT_BUDGET,
   asMakersContext,
   clampText,
   createSSEResponse,
   errorResponse,
   jsonOk,
+  levenshtein,
   nowIso,
   requireAuth,
   resolveConversationId,
   sseDone,
   sseEvent,
   type MakersContext,
+  type StoreMessage,
 } from './_shared.ts'
 import {
   chatCompletion,
@@ -70,14 +73,21 @@ import { buildPersona, humanNowText, readTimeZone } from './_persona.ts'
 import {
   appendChatlogRecord,
   clampMemoryForContext,
+  clearActiveTurn,
+  drainQueue,
   ensureMemorySeed,
+  enqueueMessage,
+  getActiveTurn,
+  isImageUserMessage,
   loadMessages,
   persistHistory,
   readMemoryFile,
   recordToolCalls,
+  setActiveTurn,
   SYSTEM_HISTORY_GUIDANCE,
+  type ActiveTurn,
 } from './_memory.ts'
-import { buildTools } from './_tools.ts'
+import { buildTools, formatDeclinedContent } from './_tools.ts'
 
 // Generous budget for interactive chat: the user is present and can stop the
 // turn, so a long working session (e.g. sandbox exploration) is allowed.
@@ -143,6 +153,68 @@ export const CHAT_CONVERSATION_MODE = [
 const CHAT_TURN_TIMEOUT_MS = 120_000
 
 /**
+ * User-message merge window (feature ①): a new message B is only considered a
+ * resend/correction of the previous user message A when A arrived within this
+ * window. Injectable — tests pass a short value, never a real 30s sleep.
+ */
+export const MESSAGE_MERGE_WINDOW_MS = 30_000
+
+/**
+ * How long an AI turn stays "active" (feature ②): while a turn is running, a new
+ * non-merge user message is QUEUED instead of starting a competing turn. Covers
+ * the full chat wall-clock budget so the flag never expires mid-turn.
+ */
+export const TURN_ACTIVE_MS = 120_000
+
+/** User-facing message when a message was queued mid-turn (feature ②). */
+export const QUEUED_MESSAGE = '已在AI当前轮中插话，会在下一次思考时处理'
+
+/** Levenshtein threshold for a "similar resend" (typo-fixed retype). */
+const MERGE_LEVENSHTEIN_MAX = 2
+/** Relative length-difference threshold for a "similar resend". */
+const MERGE_LEN_RATIO_MAX = 0.3
+/** Absolute short-fragment threshold (习惯性补字). */
+const MERGE_FRAGMENT_LEN_MAX = 3
+/** Relative short-fragment threshold (习惯性补字). */
+const MERGE_FRAGMENT_RATIO_MAX = 0.3
+
+/**
+ * Pure merge detector (feature ①). Compares the previous user message `aText`
+ * (arrived at `aTsMs`) against the incoming `bText` (arrived at `bTsMs`):
+ * - `'replace'`  — a similar resend / typo-fixed retype: B replaces A, one answer.
+ * - `'fragment'` — a short habitual correction fragment: B is archived only,
+ *                  the AI answers A once.
+ * - `null`       — a genuinely new message: B gets its own turn.
+ * The time window is injectable (`windowMs`, defaults to `MESSAGE_MERGE_WINDOW_MS`).
+ */
+export function detectMessageMerge(
+  aText: string,
+  bText: string,
+  aTsMs: number,
+  bTsMs: number,
+  windowMs: number = MESSAGE_MERGE_WINDOW_MS,
+): 'replace' | 'fragment' | null {
+  const a = aText.trim()
+  const b = bText.trim()
+  if (!a || !b) return null
+  if (bTsMs - aTsMs > windowMs) return null
+  const maxLen = Math.max(a.length, b.length)
+  // "Similar resend" = either a tiny absolute edit distance (≤2 chars) OR a
+  // tiny RELATIVE edit distance (≤30% of the longer text). The relative branch
+  // catches long messages with a few corrections; it is a CONTENT measure, not
+  // a bare length difference — two unrelated same-length messages (e.g. two
+  // different questions) must never merge.
+  const similar =
+    levenshtein(b, a) <= MERGE_LEVENSHTEIN_MAX ||
+    (maxLen > 0 && levenshtein(b, a) / maxLen <= MERGE_LEN_RATIO_MAX)
+  if (similar) return 'replace'
+  const fragment =
+    b.length <= MERGE_FRAGMENT_LEN_MAX || (a.length > 0 && b.length / a.length <= MERGE_FRAGMENT_RATIO_MAX)
+  if (fragment) return 'fragment'
+  return null
+}
+
+/**
  * Combine the external request signal with a wall-clock turn budget (P2-3).
  * The returned signal aborts when EITHER the client disconnects or the budget
  * expires; `expired()` distinguishes the two so callers can surface a clear
@@ -203,6 +275,17 @@ export type ChatResult = {
   reply: string
   conversationId: string
   now: string
+  /** True when the message was queued mid-turn (feature ②) — no turn ran. */
+  queued?: boolean
+  /** User-facing queue notice (feature ②). */
+  message?: string
+  /** True when the model declined to answer (feature ③) — no assistant text. */
+  declined?: boolean
+  /**
+   * False when the model declined (the frontend surfaces "no reply" instead of
+   * an error); absent/true otherwise. Mirrors the SSE `declined` event.
+   */
+  replied?: boolean
 }
 
 export async function runChat(
@@ -218,7 +301,12 @@ export async function runChat(
   const store = context.store
   if (!store) throw new Error('Store is not available in this context.')
 
-  await persistUserMessage(context, conversationId, message, images)
+  // Feature ① + ②: merge a resend/correction, or queue a mid-turn interrupt.
+  // The store is only touched here when a real new turn should start.
+  const disposition = await handleIncomingUserMessage(context, conversationId, message, images)
+  if (disposition.action === 'queued') {
+    return { reply: '', conversationId, now: nowIso(), queued: true, message: QUEUED_MESSAGE }
+  }
 
   // The persona is just the wall clock + MEMORY.md (the AI's self). Seeding +
   // reading MEMORY.md is best-effort so a Blob-less first turn still works.
@@ -229,7 +317,7 @@ export async function runChat(
   })
 
   // History as a real messages array — the store already contains the new user
-  // message (appended above), so it flows to the model as its own entry.
+  // message (appended/handled above), so it flows to the model as its own entry.
   const history = await loadMessages(context, conversationId)
 
   // Wall-clock budget for the whole turn (P2-3): independent of the client's
@@ -242,6 +330,9 @@ export async function runChat(
     { role: 'system', content: `${persona}\n\n${CHAT_CONVERSATION_MODE}\n\n${SYSTEM_HISTORY_GUIDANCE}` },
     ...history,
   ]
+  // Feature ②: mark the turn active so a concurrent user message queues instead
+  // of forking a competing turn. Cleared in the finally below.
+  await setActiveTurn(context, conversationId, activeTurnMarker())
   try {
     const result = await chatCompletionWithVisionFallback(
       {
@@ -257,9 +348,20 @@ export async function runChat(
         // JSON path mirrors the streaming path: keep every intermediate sentence
         // and give a neutral note to a tool-only round instead of an empty reply.
         accumulateText: true,
+        // Feature ②: fold interrupt-queue user messages into the next LLM request.
+        drainMessages: async () => drainQueue(context, conversationId),
       },
       hasImages,
     )
+
+    // Feature ③: the model declined — end the turn with a context row, no text.
+    if (result.declined) {
+      await persistHistory(context, conversationId, 'assistant', formatDeclinedContent(result.declinedContent), {
+        kind: 'declined',
+        metadata: { kind: 'declined' },
+      })
+      return { reply: '', conversationId, now: nowIso(), declined: true, replied: false }
+    }
 
     // Persist the per-round timeline into the chatlog archive. Chat respects the
     // TRUE event order (思考 → 工具 → 思考 → 工具 → 回答): every intermediate round
@@ -305,6 +407,7 @@ export async function runChat(
     throw error
   } finally {
     budget.dispose()
+    await clearActiveTurn(context, conversationId)
   }
 }
 
@@ -392,7 +495,13 @@ async function* chatStreamGenerator(
   if (!message.trim() && !hasImages) throw new Error('message is required and must not be empty.')
   if (!context.store) throw new Error('Store is not available in this context.')
 
-  await persistUserMessage(context, conversationId, message, images)
+  // Feature ① + ②: merge a resend/correction, or queue a mid-turn interrupt.
+  const disposition = await handleIncomingUserMessage(context, conversationId, message, images)
+  if (disposition.action === 'queued') {
+    yield sseEvent({ type: 'queued', content: QUEUED_MESSAGE })
+    yield sseDone()
+    return
+  }
 
   const memory = await readMemoryWithSeedSafe(context)
   const persona = buildPersona({
@@ -409,6 +518,8 @@ async function* chatStreamGenerator(
   // expiry the descriptive CHAT_TIMEOUT_MESSAGE error replaces a silent abort.
   const budget = createTurnBudget(signal, timeoutMs)
   const tools = buildTools({ context, conversationId, signal: budget.signal })
+  // Feature ②: mark the turn active (queued interrupts join the next LLM request).
+  await setActiveTurn(context, conversationId, activeTurnMarker())
 
   try {
     for (let attempt = 1; attempt <= MAX_VISION_ATTEMPTS; attempt += 1) {
@@ -430,6 +541,7 @@ async function* chatStreamGenerator(
     throw error
   } finally {
     budget.dispose()
+    await clearActiveTurn(context, conversationId)
   }
 }
 
@@ -541,6 +653,9 @@ async function* streamChatTurn(
 
   for (let turn = 1; turn <= CHAT_MAX_TURNS; turn += 1) {
     if (signal?.aborted) throw abortError()
+    // Feature ②: fold interrupt-queue user messages into THIS LLM request.
+    const drained = await drainQueue(context, conversationId)
+    if (drained.length > 0) current = [...current, ...drained]
     // Last round: tools are withheld so the model MUST answer in words — it
     // can't end the conversation with a tool call. (The persona/memory already
     // explains this so the model isn't surprised.)
@@ -578,10 +693,26 @@ async function* streamChatTurn(
       if (signal?.aborted) throw abortError()
       const args = safeParseArguments(call.arguments)
       yield sseEvent({ type: 'tool_call', name: call.name, arguments: args })
-      const result = await tools.run(call.name, args, signal).catch((error: unknown) => ({
+      const result = await tools.run(call.name, args, signal).catch((error: unknown): {
+        content: string
+        isError: boolean
+        declined?: boolean
+        declineReason?: string
+      } => ({
         content: error instanceof Error ? `Tool error: ${error.message}` : `Tool error: ${String(error)}`,
         isError: true,
       }))
+      // Feature ③: the model declined — end the turn, no assistant text.
+      if (result.declined) {
+        const declinedContent = formatDeclinedContent(result.declineReason)
+        await persistHistory(context, conversationId, 'assistant', declinedContent, {
+          kind: 'declined',
+          metadata: { kind: 'declined' },
+        })
+        yield sseEvent({ type: 'declined', content: declinedContent })
+        yield sseDone()
+        return
+      }
       const modelText = clampText(result.content, MODEL_TOOL_RESULT_MAX)
       roundToolResults.push({
         name: call.name,
@@ -685,6 +816,62 @@ async function readMemoryWithSeedSafe(context: MakersContext): Promise<string> {
 }
 
 /**
+ * Active-turn marker for feature ②: the turn is "active" for TURN_ACTIVE_MS
+ * (matching the chat wall-clock budget), so an interrupt message arriving
+ * mid-turn is queued instead of forking a competing turn.
+ */
+function activeTurnMarker(): ActiveTurn {
+  const startedAt = Date.now()
+  return { startedAt, expiresAt: startedAt + TURN_ACTIVE_MS }
+}
+
+/** Result of `handleIncomingUserMessage` (feature ① + ②). */
+type IncomingUserDisposition =
+  | { action: 'turn'; merged?: 'replace' | 'fragment' }
+  | { action: 'queued' }
+
+/**
+ * Merge/queue entry point for an incoming chat message (features ① + ②).
+ * Runs BEFORE the store write so the merge decision is race-free:
+ * - a similar resend / short fragment merges into the previous user row (no new
+ *   independent turn — the AI answers the merged message once);
+ * - otherwise, when an AI turn is already active, the message is QUEUED and the
+ *   current request returns without starting a turn (it joins the next LLM call);
+ * - otherwise the message is persisted normally and a new turn starts.
+ */
+async function handleIncomingUserMessage(
+  context: MakersContext,
+  conversationId: string,
+  message: string,
+  images: string[],
+  mergeWindowMs: number = MESSAGE_MERGE_WINDOW_MS,
+): Promise<IncomingUserDisposition> {
+  // Only a plain-text message can be a resend/correction; an image-bearing
+  // message is always a genuinely new turn (the image is its own payload).
+  if (images.length === 0) {
+    const merge = await detectMergeWithLastUser(context, conversationId, message, mergeWindowMs)
+    if (merge === 'replace') {
+      await applyMergeReplace(context, conversationId, message)
+      return { action: 'turn', merged: 'replace' }
+    }
+    if (merge === 'fragment') {
+      await archiveMergeFragment(context, conversationId, message)
+      return { action: 'turn', merged: 'fragment' }
+    }
+  }
+  // Not a merge: an active AI turn means the user interrupted — queue the
+  // message so it joins the next LLM request instead of starting a new turn.
+  // If the queue write fails (Blob unavailable), fall through to a new turn so
+  // the message is never lost.
+  const active = await getActiveTurn(context, conversationId)
+  if (active && (await enqueueMessage(context, conversationId, message))) {
+    return { action: 'queued' }
+  }
+  await persistUserMessage(context, conversationId, message, images)
+  return { action: 'turn' }
+}
+
+/**
  * Persist the incoming chat turn as the history/archive user row. With images
  * the content is serialized to a JSON string (store is string-typed) and
  * tagged `metadata.kind:'image-user'` so `loadMessages` restores the content
@@ -706,6 +893,111 @@ async function persistUserMessage(
     storeContent,
     hasImages ? { metadata: { kind: 'image-user', hasImage: true } } : undefined,
   )
+}
+
+/**
+ * Detect whether the incoming `message` is a resend/correction of the last real
+ * user message in the store (feature ①). Reads the newest page; the last
+ * `role:'user'` row that is not a heartbeat trigger / compact summary / image
+ * row is A. A row without a usable timestamp is treated as too old to merge.
+ */
+async function detectMergeWithLastUser(
+  context: MakersContext,
+  conversationId: string,
+  message: string,
+  windowMs: number,
+): Promise<'replace' | 'fragment' | null> {
+  const last = await findLastUserMessage(context, conversationId)
+  if (!last || isImageUserMessage(last)) return null
+  const ts = typeof last.createdAt === 'string' ? Date.parse(last.createdAt) : NaN
+  if (!Number.isFinite(ts)) return null
+  return detectMessageMerge(last.content, message, ts, Date.now(), windowMs)
+}
+
+/**
+ * The most recent real user row (role:'user', not a heartbeat trigger / compact
+ * summary). Used as merge candidate A. Store read failures degrade to null.
+ */
+async function findLastUserMessage(
+  context: MakersContext,
+  conversationId: string,
+): Promise<StoreMessage | null> {
+  if (!context.store) return null
+  try {
+    const messages = await context.store.getMessages({
+      conversationId,
+      limit: STORE_READ_LIMIT,
+      order: 'desc',
+    })
+    for (const message of messages) {
+      if (message.role !== 'user') continue
+      const kind = (message.metadata as { kind?: unknown } | undefined)?.kind
+      if (kind === 'heartbeat' || kind === 'summary') continue
+      return message
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+/**
+ * Case 1 (replace): B is a similar resend / typo fix of A. A is archived as
+ * `superseded:true` and removed from the store; B is written in its place
+ * (archived `merged:true`). No new round — the AI answers B once.
+ */
+async function applyMergeReplace(
+  context: MakersContext,
+  conversationId: string,
+  message: string,
+): Promise<void> {
+  const last = await findLastUserMessage(context, conversationId)
+  if (!last) {
+    // No row to supersede (shouldn't happen after detection): fall back to a
+    // normal persist so the message is never lost.
+    await persistUserMessage(context, conversationId, message, [])
+    return
+  }
+  await archiveChatlogBestEffort(context, {
+    role: 'user',
+    content: last.content,
+    kind: 'user',
+    metadata: { superseded: true },
+  })
+  const id = last.messageId ?? last.id
+  if (id) {
+    try {
+      await context.store?.deleteMessage({ conversationId, messageId: id })
+    } catch {
+      /* best-effort: the append below still keeps B */
+    }
+  }
+  // Write B as a clean store row + archive it (merged:true).
+  await context.store?.appendMessage({ conversationId, role: 'user', content: message, metadata: {} })
+  await archiveChatlogBestEffort(context, {
+    role: 'user',
+    content: message,
+    kind: 'user',
+    metadata: { merged: true },
+  })
+}
+
+/**
+ * Case 2 (fragment): B is a short habitual correction fragment. It is archived
+ * to the chatlog ONLY (`mergeFragment:true`) — never a store row — so the AI
+ * context keeps A alone and answers it once.
+ */
+async function archiveMergeFragment(
+  context: MakersContext,
+  conversationId: string,
+  message: string,
+): Promise<void> {
+  await archiveChatlogBestEffort(context, {
+    role: 'user',
+    content: message,
+    kind: 'user',
+    metadata: { mergeFragment: true },
+  })
 }
 
 /** One OpenAI-ready content value for the incoming user turn. */
