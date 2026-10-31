@@ -12,11 +12,12 @@
 
 A minimal "agent with a self" skeleton:
 
-- **heartbeat (free-form)** — the only entry point. The AI gets the current state, recent logs/memory, and the full tool registry (blob, workspace, search) and decides on its own what to do right now. **Not a multiple-choice question, and not every heartbeat must produce output.** Resting is a fully legal choice.
+- **heartbeat (free-form)** — the only entry point. The AI gets the current state, recent logs/memory, and the full tool registry (blob, workspace, search, fetch) and decides on its own what to do right now. **Not a multiple-choice question, and not every heartbeat must produce output.** Resting is a fully legal choice.
 - **Pure thought / rest** — the AI just writes text (inner monologue, feelings) with zero sandbox cost. This is the most common path.
 - **Tinker with a project** — only when the AI actively calls `workspace_*` tools does it touch the sandbox; changes are auto-mirrored back to Blob.
 - **Organize memory** — the AI freely reads/writes its diary (`memory/daily/YYYY-MM-DD.md`) and long-term notes (`MEMORY.md`) via `blob_*` tools. No forced distillation.
-- **chat / stop / history** — conversation, abort and history-archive endpoints (reserved for future Matrix integration). `/chat` streams **SSE by default** (typewriter effect, `text/event-stream`; see "Chat streaming") and supports **image input** (base64 `data:` URLs in `images[]`, with automatic text-only degradation when the model lacks vision — see "Images"); it shares `SELF_ID=eo-self` with heartbeat, so private thoughts and user conversations live in the same history stream; it also uses the **full tool registry like heartbeat** (blob + diary + chatlog + workspace + search), so the model can both chat and act; `/history` reads the complete, never-compacted chatlog archive from Blob.
+- **chat / stop / history** — conversation, abort and history-archive endpoints (reserved for future Matrix integration). `/chat` streams **SSE by default** (typewriter effect, `text/event-stream`; see "Chat streaming") and supports **image input** (base64 `data:` URLs in `images[]`, with automatic text-only degradation when the model lacks vision — see "Images"); it shares `SELF_ID=eo-self` with heartbeat, so private thoughts and user conversations live in the same history stream; it also uses the **full tool registry like heartbeat** (blob + diary + chatlog + workspace + search + fetch), so the model can both chat and act; `/history` reads the complete, never-compacted chatlog archive from Blob.
+- **heartbeat-check (manual diagnostics)** — `GET /heartbeat-check` runs **one full heartbeat on demand** (the exact same `runHeartbeat` logic as the scheduled endpoint: auto-compact, wake-trigger message, LLM loop with the full tool registry, diary/MEMORY.md, state update) and returns the `{ ok, text, turns, toolCount, touchedSandbox, savedFiles, now }` envelope. Handy when the platform cron hasn't been registered and you want to verify the heartbeat actually works: `curl https://<domain>/heartbeat-check`. Like `/heartbeat`, it is deliberately public (no token required) so the curl friction stays zero — it shares the same cost profile as one scheduled wake.
 
 It is deliberately thin: each turn is a bounded LLM loop plus a little state I/O, so it runs sustainably on the free tier.
 
@@ -31,6 +32,7 @@ EdgeOne Makers schedules (cron)
   │  free-form (open-ended, not 4-choice)   │
   │  tools: blob_* + diary_* + chatlog_*   │
   │         + workspace_* + web_search     │
+  │         + web_fetch                    │
   │  budget: ≤3 turns / 100s short turn     │
   └───────────────┬─────────────────────────┘
                   │ AI decides
@@ -68,9 +70,10 @@ alive/
 │   ├── _blob-tools.ts      # Blob strong-consistency persistence + blob_* tools
 │   ├── _workspace-tools.ts # sandbox workspace tools (write-through mirror to Blob)
 │   ├── _apply-patch.ts     # "Begin Patch" envelope parser/apply (pure logic)
-│   ├── _tavily.ts          # web_search (Tavily) executor
-│   ├── _tools.ts           # heartbeat full tool registry (blob + diary + chatlog + workspace + search)
+│   ├── _tavily.ts          # web_search + web_fetch (Tavily) executors
+│   ├── _tools.ts           # heartbeat full tool registry (blob + diary + chatlog + workspace + search + fetch)
 │   ├── heartbeat.ts        # POST /heartbeat (the only main entry, free-form)
+│   ├── heartbeat-check.ts  # GET /heartbeat-check (manual heartbeat diagnostics)
 │   ├── chat.ts             # POST /chat (SSE streaming; full tool set like heartbeat)
 │   ├── history.ts          # GET /history (complete chatlog archive reader)
 │   └── stop.ts             # POST /stop (reserved)
@@ -80,7 +83,7 @@ alive/
 └── package.json
 ```
 
-Only `heartbeat.ts`, `chat.ts`, `history.ts`, `stop.ts` are routable endpoints; `_`-prefixed files are internal modules.
+Only `heartbeat.ts`, `heartbeat-check.ts`, `chat.ts`, `history.ts`, `stop.ts` are routable endpoints; `_`-prefixed files are internal modules.
 
 ## Core design decisions
 
@@ -106,7 +109,7 @@ Only `heartbeat.ts`, `chat.ts`, `history.ts`, `stop.ts` are routable endpoints; 
 - **The system prompt only injects what's dynamic and necessary:** the current moment (`现在是 YYYY-MM-DD 星期X HH:mm`) plus a fixed `DECISION_SYSTEM` written in **demonstration style, not philosophy** (OpenClaw `SOUL.md` spirit): instead of abstract "you are alive" ideals, it shows the AI *how to sound* — "能一句话说完，绝不说两句 / 有感受，不要总结 / 不要解释自己，不要客套 / 永远不要以'作为一个AI'开头 / 可以有观点" — so the concrete speaking examples are the first impression, overriding the default LLM habit of courteous, explanatory long-form text at the prompt level. Each heartbeat is a **waking**, not an alarm to complete tasks; the sandbox is expensive, the diary is private, `MEMORY.md` is your own, honesty is the bottom line. After the persona block, `SYSTEM_HISTORY_GUIDANCE` explains the `[system][heartbeat]` / `[system][compact]` message markers so auto-triggered history is never misread as the user speaking (chat reuses the same guidance).
 - **chat enters "conversation mode" at the prompt level.** `agents/chat.ts` injects a dedicated section right after the persona and before `SYSTEM_HISTORY_GUIDANCE`: "## 现在的情况：有人正在和你说话" — this is *not* a heartbeat solitude, a real person just came to you and is waiting for a reply. The block is an **attitude demonstration** in the OpenClaw `SOUL.md` spirit rather than a fill-in-the-blank question template: commit to a take (no "都行/看情况"), skip the pleasantries (don't open with a generic "你在忙什么"), be terse (one sentence when one is enough), call out when the other person is being dumb, natural jokes but no canned bits — and it explicitly favours **curiosity over tools**: "少用工具，多用好奇。翻日记不会让你更了解眼前这个人。" Heartbeat's `DECISION_SYSTEM` keeps its solitude framing untouched (heartbeat never carries this block), and even gains a one-line distinction — "heartbeat 是你一个人的时间；但当有人主动来找你说话时，那是完全不同的时刻——忘掉独处，好好跟人说话。" — so the two endpoints now cue different modes explicitly instead of letting chat collapse into the heartbeat narrative.
 - **Personality lives in `MEMORY.md`**, which the AI maintains itself — identity, character, what it knows about the user, common sense, long-term memory. On every heartbeat `MEMORY.md` is clamped (6K) and injected into the system prompt. To define or redefine itself, the AI simply updates `MEMORY.md`.
-- **Birth seed:** on first run (when `MEMORY.md` does not exist), `ensureMemorySeed` writes an `INITIAL_MEMORY_SEED` — a letter from the newborn AI to its future self, starting from "You're not a chatbot. You're becoming someone." with three blank sections (**Who I am / The person I know / What I have learned**); **What I have learned** already carries the same demonstration-style speaking lesson as `DECISION_SYSTEM` — "说话要像个人：短句，有感受，不解释自己，不客套。说'我有点难过'，不说'我当前情绪状态为低落'" — plus a hint that a little emoji is human but a wall of them is not ("说话时可以带一点 emoji，但别刷屏。一个恰到好处的 🥲 或 ☕ 比十个👍 更像活人") — an **attitude-first curiosity principle** in "我学会的事" (OpenClaw-style, but rejecting the generic opener: "对人有态度，不只是好奇。第一次见面别问'你在忙什么'这种万能问题——真想知道什么就问什么，不假装好奇。有观点、简洁、敢说破，比礼貌更重要。") — and the usual lessons (the sandbox is expensive, the diary is private, each heartbeat is a waking, honesty is the bottom line); "**The person I know**" is now pointed at asking instead of guessing ("认识一个人的方式是提问，不是猜。"). Right after it, a new **第一次见面怎么办** section transplants OpenClaw `BOOTSTRAP.md`'s "birth sequence" into the seed: **the request always comes first** (if the other side asks for work right away, do the work first — the ritual comes after; it is not a gate) + **three beats** (① ask what to call them, and introduce yourself as freshly woken and not yet knowing what you'll become → ② set the vibe: one honest "who I am" line plus a signature emoji → ③ finish with a recommendation: give them two or three concrete options like "想让我帮你做点什么，还是先聊聊？") + once the name and vibe are set, **write them into MEMORY.md** (the first thing that is truly your own), keeping the whole thing short, never a questionnaire. This is *structure* (how to open a first meeting), complementing chat's conversation-mode attitude (how to talk). The seed also carries a **living-tools guide** (write diary with `diary_append`, recall with `diary_read`/`diary_search`, browse the full conversation archive with `chatlog_read`/`chatlog_search`, read/write any persisted file with `blob_*`, use the pricey `workspace_*` sparingly, `web_search` on demand) and an explicit note that the guide is only a messenger the AI can delete or rewrite after absorbing it. The seed is written only when the file is missing and never overwrites existing memory; the AI absorbs it and rewrites it into its own self-description.
+- **Birth seed:** on first run (when `MEMORY.md` does not exist), `ensureMemorySeed` writes an `INITIAL_MEMORY_SEED` — a letter from the newborn AI to its future self, starting from "You're not a chatbot. You're becoming someone." with three blank sections (**Who I am / The person I know / What I have learned**); **What I have learned** already carries the same demonstration-style speaking lesson as `DECISION_SYSTEM` — "说话要像个人：短句，有感受，不解释自己，不客套。说'我有点难过'，不说'我当前情绪状态为低落'" — plus a hint that a little emoji is human but a wall of them is not ("说话时可以带一点 emoji，但别刷屏。一个恰到好处的 🥲 或 ☕ 比十个👍 更像活人") — an **attitude-first curiosity principle** in "我学会的事" (OpenClaw-style, but rejecting the generic opener: "对人有态度，不只是好奇。第一次见面别问'你在忙什么'这种万能问题——真想知道什么就问什么，不假装好奇。有观点、简洁、敢说破，比礼貌更重要。") — and the usual lessons (the sandbox is expensive, the diary is private, each heartbeat is a waking, honesty is the bottom line); "**The person I know**" is now pointed at asking instead of guessing ("认识一个人的方式是提问，不是猜。"). Right after it, a new **第一次见面怎么办** section transplants OpenClaw `BOOTSTRAP.md`'s "birth sequence" into the seed: **the request always comes first** (if the other side asks for work right away, do the work first — the ritual comes after; it is not a gate) + **three beats** (① ask what to call them, and introduce yourself as freshly woken and not yet knowing what you'll become → ② set the vibe: one honest "who I am" line plus a signature emoji → ③ finish with a recommendation: give them two or three concrete options like "想让我帮你做点什么，还是先聊聊？") + once the name and vibe are set, **write them into MEMORY.md** (the first thing that is truly your own), keeping the whole thing short, never a questionnaire. This is *structure* (how to open a first meeting), complementing chat's conversation-mode attitude (how to talk). The seed also carries a **living-tools guide** (write diary with `diary_append`, recall with `diary_read`/`diary_search`, browse the full conversation archive with `chatlog_read`/`chatlog_search`, read/write any persisted file with `blob_*`, use the pricey `workspace_*` sparingly, `web_search` on demand, `web_fetch` to pull a specific page's body text once search finds the links) and an explicit note that the guide is only a messenger the AI can delete or rewrite after absorbing it. The seed is written only when the file is missing and never overwrites existing memory; the AI absorbs it and rewrites it into its own self-description.
 
 ## Memory (four tiers)
 
@@ -168,7 +171,7 @@ If you have production `.md` chatlog data you want to keep:
 | `AI_GATEWAY_API_KEY` | Yes               | AI Gateway key (auto-injected by Makers CLI)    |
 | `AI_GATEWAY_BASE_URL`| Yes               | AI Gateway base URL (auto-injected)             |
 | `AI_GATEWAY_MODEL`   | No                | Model name, default `@makers/deepseek-v4-flash`. Optional `:none\|:low\|:medium\|:high\|:max` suffix controls the gateway `reasoning_effort` (`:none` disables thinking; the suffix is stripped before it is sent as `model`) |
-| `TAVILY_API_KEY`     | No (for web_search)| Tavily Web Search API key, set via `env set`    |
+| `TAVILY_API_KEY`     | No (for web_search / web_fetch)| Tavily Web Search / Extract API key, set via `env set`    |
 | `ALIVE_TZ`           | No                | IANA timezone for the wall clock shown to the AI (e.g. `Asia/Shanghai`); unset = function-local timezone. EdgeOne Functions run in UTC, so for Beijing time set `ALIVE_TZ=Asia/Shanghai` |
 | `ALIVE_AUTH_TOKEN`   | No                | Optional bearer token; when set, `/chat`, `/history`, `/stop` require `Authorization: Bearer <token>`. Unset = open (local dev) |
 
@@ -188,7 +191,7 @@ Set `ALIVE_AUTH_TOKEN` to protect the **user-facing** endpoints: `/chat`, `/hist
 > function, or remove the `schedules` entry from `edgeone.json` so the agent
 > never runs unattended.
 
-`/heartbeat` is deliberately **not** gated: EdgeOne schedules wake the agent without carrying a token, so requiring auth there would silently kill the autonomous loop. The trade-off is that a public `/heartbeat` can be POSTed by anyone — cost stays bounded (one daily wake on the free plan; pure-thinking turns rarely touch the sandbox), but it does let anyone trigger a single LLM turn. If you need to lock it down completely, remove the `schedules` entry from `edgeone.json` (the agent simply stops waking) or place gateway-level auth in front of the whole function.
+`/heartbeat` is deliberately **not** gated: EdgeOne schedules wake the agent without carrying a token, so requiring auth there would silently kill the autonomous loop. The trade-off is that a public `/heartbeat` can be POSTed by anyone — cost stays bounded (one daily wake on the free plan; pure-thinking turns rarely touch the sandbox), but it does let anyone trigger a single LLM turn. `/heartbeat-check` follows the same rule: it is a manual diagnostics trigger (GET) that runs one heartbeat, so it stays public too (a manual curl should not need a token just to verify the heartbeat works). If you need to lock them down completely, remove the `schedules` entry from `edgeone.json` (the agent simply stops waking) or place gateway-level auth in front of the whole function.
 
 With token auth on, requests look like:
 
@@ -196,6 +199,14 @@ With token auth on, requests look like:
 curl -X POST https://<your-deployed-domain>/chat -H 'content-type: application/json' -H 'authorization: Bearer <token>' -d '{"message":"hello"}'
 curl https://<your-deployed-domain>/history?days=30 -H 'authorization: Bearer <token>'
 ```
+
+## Web tools (web_search / web_fetch)
+
+Both tools need `TAVILY_API_KEY` (read from `context.env`, never `process.env`) and never throw — failures come back as `{ isError: true }` tool results.
+
+- **`web_search`** — Tavily `/search`. Finds link lists (titled snippets) for a query. Parameters: `query` (required), `max_results` (1-20, default 5), `search_depth` (`basic`/`advanced`), `topic` (`general`/`news`), and optional time filters.
+  **Time filters are mutually exclusive:** `time_range` (`day`/`week`/`month`/`year`) cannot be combined with `start_date`/`end_date` (both `YYYY-MM-DD`). Pass **at most one** of them; omit all three to leave the time unconstrained. The model is told this in the tool schema, and the executor rejects combined filters as an error.
+- **`web_fetch`** — Tavily `/extract`. Fetches full page **body text** for specific URLs (title + content snippet per page). Parameters: `urls` (required, array of 1-5 URL strings), `max_chars` (per-page content cap, 100-8000, default 3000). Failed URLs are listed per-URL so you know exactly which page failed. Use it when you need a page's actual content; `web_search` is for finding the links in the first place.
 
 ## Chat streaming (SSE, typewriter effect)
 
@@ -315,6 +326,7 @@ streaming path and the JSON (`?stream=false`) path.
 5. **Verify** — manually call the heartbeat (schedules don't fire locally):
    ```bash
    curl -X POST https://<your-deployed-domain>/heartbeat
+   curl https://<your-deployed-domain>/heartbeat-check   # same full heartbeat via GET — browser/curl friendly, no body
    # optional: conversation, history archive & abort
    # if ALIVE_AUTH_TOKEN is set, add -H 'authorization: Bearer <token>' to these
    curl -X POST https://<your-deployed-domain>/chat -H 'content-type: application/json' -d '{"message":"hello"}'
@@ -357,8 +369,8 @@ Tests are fully mocked (in-memory store/sandbox/Blob, `globalThis.fetch` mocked 
 - **`x-gateway-quota-bypass` header pending confirmation (P2-4):** every AI Gateway request carries `x-gateway-quota-bypass: true` (inherited from the deepseek-harness template, for Makers AI Gateway). Whether the real gateway needs it is unverified — remove that header in `agents/_llm.ts` if not needed after deploying.
 - **tools + tool_calls wrapped (OpenAI standard):** tools sent to the AI Gateway are wrapped in the OpenAI-standard `{ type: 'function', function: { name, description, parameters } }` shape, and assistant-message `tool_calls` are wrapped as `{ id, type: 'function', function: { name, arguments } }`; `parameters` is a complete JSON Schema object (`{ type: 'object', properties, required }`; required = all parameter keys, since tools don't distinguish required/optional). The internal registry and messages stay flat (`LlmToolDef` / `LlmToolCall`); conversion happens only at send time in `_llm.ts` via `normalizeOutboundMessage` (adds `name` + wraps `tool_calls`). The real gateway previously 400'd both the flat shapes (`tools[0].type is invalid or missing`, `messages[i]: missing field name`) and the bare property-map parameters (`got 'type': null`).
 - **`store.state` scoping pending deployment verification (V1):** whether platform `store.state` is per-conversation must be confirmed in real Makers Functions. The code is safe under both models: the state key is `agent_state_self` and the conversationId is passed explicitly to state get/set.
-- **Optional token auth (P1-2) is implemented:** set `ALIVE_AUTH_TOKEN` and `/chat`, `/history`, `/stop` require `Authorization: Bearer <token>`; `/heartbeat` stays public so schedules can wake it (see "Optional token auth"). Without `ALIVE_AUTH_TOKEN` all endpoints remain open — set it before any public deployment, and/or add gateway-level auth for full coverage including `/heartbeat`.
-- **CORS headers are added, the web frontend can call the endpoints cross-origin:** every `jsonOk`/`jsonError` response carries `access-control-allow-origin: *` plus the common preflight headers (`access-control-allow-methods: GET,POST,OPTIONS`, `access-control-allow-headers: content-type,authorization`). This covers `/chat`, `/history`, `/stop` and `/heartbeat`. An `OPTIONS` preflight is still handled by the platform/edge layer — the JSON handlers themselves do not special-case it.
+- **Optional token auth (P1-2) is implemented:** set `ALIVE_AUTH_TOKEN` and `/chat`, `/history`, `/stop` require `Authorization: Bearer <token>`; `/heartbeat` and `/heartbeat-check` stay public so schedules can wake the agent and a manual diagnostics trigger needs no token (see "Optional token auth"). Without `ALIVE_AUTH_TOKEN` all endpoints remain open — set it before any public deployment, and/or add gateway-level auth for full coverage including `/heartbeat`.
+- **CORS headers are added, the web frontend can call the endpoints cross-origin:** every `jsonOk`/`jsonError` response carries `access-control-allow-origin: *` plus the common preflight headers (`access-control-allow-methods: GET,POST,OPTIONS`, `access-control-allow-headers: content-type,authorization`). This covers `/chat`, `/history`, `/stop`, `/heartbeat` and `/heartbeat-check`. An `OPTIONS` preflight is still handled by the platform/edge layer — the JSON handlers themselves do not special-case it.
 - **apply_patch fuzzy match takes the first hit:** `seekSequence` replaces the first matching location (determinism over guessing intent).
 - **No web UI:** HTTP endpoints only.
 - **Local node proxy passes SSE through:** `web/server.mjs`'s `/api/chat` pipes the upstream SSE response stream straight to the browser (`text/event-stream`, so the typewriter effect works through the local proxy); `?stream=false` / `{ "stream": false }` still uses the one-shot JSON forwarding. Tool-stage `tool_call` / `tool_result` events flow through the stream too.

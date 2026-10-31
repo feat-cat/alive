@@ -621,6 +621,7 @@ describe('ensureMemorySeed / INITIAL_MEMORY_SEED', () => {
     assert.match(INITIAL_MEMORY_SEED, /blob_write/)
     assert.match(INITIAL_MEMORY_SEED, /workspace_/)
     assert.match(INITIAL_MEMORY_SEED, /web_search/)
+    assert.match(INITIAL_MEMORY_SEED, /web_fetch/)
   })
 
   test('seed tells the AI the birth guide is a deletable messenger, not the self', () => {

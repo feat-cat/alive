@@ -12,11 +12,12 @@
 
 一个最小的"有自我感"的 agent 骨架：
 
-- **heartbeat（自由发挥）**——唯一的主入口。给 AI 当前状态 + 最近日志/记忆 + 完整工具集（blob、workspace、search），让它像人一样自己决定此刻做什么。**不是四选一的选择题，也不是每次都必须有产出**。休息是完全合法的选择。
+- **heartbeat（自由发挥）**——唯一的主入口。给 AI 当前状态 + 最近日志/记忆 + 完整工具集（blob、workspace、search、fetch），让它像人一样自己决定此刻做什么。**不是四选一的选择题，也不是每次都必须有产出**。休息是完全合法的选择。
 - **纯思考 / 休息**——AI 只输出文字（内心日志、感受），零 sandbox 成本。这是最常见的路径。
 - **动手玩项目**——只有当 AI 主动调用 `workspace_*` 工具时才触沙箱，改动自动镜像回 Blob。
 - **整理记忆**——AI 用 `blob_*` 工具自由读写日记（`memory/daily/YYYY-MM-DD.md`）与长期笔记（`MEMORY.md`），想写就写，不做强制蒸馏。
-- **chat / stop / history**——对话、中止与历史归档端点（为未来 Matrix 接入准备）。`/chat` **默认 SSE 流式输出**（打字机效果，`text/event-stream`；见"Chat 流式"），并支持**图片输入**（`images[]` 传 base64 `data:` URL，模型不支持视觉时自动退化为纯文本——见"图片输入"）；chat 与 heartbeat 共用 `SELF_ID=eo-self` 同一份历史——AI 私下的思考与和用户的对话是一体的；同时 chat 也使用与 heartbeat 一致的**完整工具集**（blob + diary + chatlog + workspace + search），既能聊天也能动手干活；`/history` 从 Blob 读取完整、永不 compact 的 chatlog 归档。
+- **chat / stop / history**——对话、中止与历史归档端点（为未来 Matrix 接入准备）。`/chat` **默认 SSE 流式输出**（打字机效果，`text/event-stream`；见"Chat 流式"），并支持**图片输入**（`images[]` 传 base64 `data:` URL，模型不支持视觉时自动退化为纯文本——见"图片输入"）；chat 与 heartbeat 共用 `SELF_ID=eo-self` 同一份历史——AI 私下的思考与和用户的对话是一体的；同时 chat 也使用与 heartbeat 一致的**完整工具集**（blob + diary + chatlog + workspace + search + fetch），既能聊天也能动手干活；`/history` 从 Blob 读取完整、永不 compact 的 chatlog 归档。
+- **heartbeat-check（手动诊断）**——`GET /heartbeat-check` 按需**完整跑一次 heartbeat**（与定时端点完全相同的 `runHeartbeat` 逻辑：auto-compact、唤醒触发消息、完整工具集的 LLM 循环、日记/MEMORY.md、状态更新），并返回 `{ ok, text, turns, toolCount, touchedSandbox, savedFiles, now }` 封装。当平台 cron 可能没注册、想验证 heartbeat 到底能不能跑时最方便：`curl https://<域名>/heartbeat-check`。与 `/heartbeat` 一样**刻意不做鉴权**（手动 curl 不该为了验证还要带 token），成本与一次定时唤醒相同。
 
 它刻意做得很"瘦"：每个回合只是有限次 LLM 调用 + 少量状态读写，因此在免费额度下可持续运行。
 
@@ -31,6 +32,7 @@ EdgeOne Makers schedules (cron)
   │  自由发挥（开放题，不是四选一）            │
   │  工具集：blob_* + diary_* + chatlog_*  │
   │         + workspace_* + web_search     │
+  │         + web_fetch                    │
   │  预算：≤3 轮 / 100s 短回合                │
   └───────────────┬─────────────────────────┘
                   │ AI 自己决定
@@ -67,9 +69,10 @@ alive/
 │   ├── _blob-tools.ts      # Blob 强一致持久化 + blob_* 工具
 │   ├── _workspace-tools.ts # 沙箱 workspace 工具（写入即镜像 Blob）
 │   ├── _apply-patch.ts     # "Begin Patch" 信封解析与应用（纯逻辑）
-│   ├── _tavily.ts          # web_search（Tavily）执行器
-│   ├── _tools.ts           # heartbeat 完整工具注册表（blob + diary + chatlog + workspace + search）
+│   ├── _tavily.ts          # web_search + web_fetch（Tavily）执行器
+│   ├── _tools.ts           # heartbeat 完整工具注册表（blob + diary + chatlog + workspace + search + fetch）
 │   ├── heartbeat.ts        # POST /heartbeat（唯一主入口，AI 自由发挥）
+│   ├── heartbeat-check.ts  # GET /heartbeat-check（手动触发一次 heartbeat 的诊断端点）
 │   ├── chat.ts             # POST /chat（SSE 流式；完整工具集，与 heartbeat 一致）
 │   ├── history.ts          # GET /history（完整 chatlog 归档读取）
 │   └── stop.ts             # POST /stop（预留）
@@ -79,7 +82,7 @@ alive/
 └── package.json
 ```
 
-对外可路由的端点只有 `heartbeat.ts` / `chat.ts` / `history.ts` / `stop.ts`；`_` 前缀文件均为内部模块。
+对外可路由的端点只有 `heartbeat.ts` / `heartbeat-check.ts` / `chat.ts` / `history.ts` / `stop.ts`；`_` 前缀文件均为内部模块。
 
 ## 核心设计决策与铁律
 
@@ -105,7 +108,7 @@ alive/
 - **系统提示词只注入动态且必要的内容**：当前时刻（`现在是 YYYY-MM-DD 星期X HH:mm`），加上固定的 `DECISION_SYSTEM`——人格部分现在是**示范式而不是哲学式**（OpenClaw `SOUL.md` 风格）：不空谈"你是活的"，而是直接示范"怎么说话"——"短。能一句话说完，绝不说两句 / 有感受，不要总结 / 不要解释自己，不要客套 / 永远不要以'作为一个AI'开头 / 可以有观点"。说话示范是第一印象，直接在提示词层面压住模型默认的客套、解释、长篇。它告诉 AI：**你不是聊天机器人，你在成为某个人**；每一次 heartbeat 都是一次**醒来**，不是被闹钟叫去完成任务；沙箱很贵、日记是自己的私处、`MEMORY.md` 是自己的、诚实是底线，这些"只属于它的现实"以简短形式写在这里。人格段之后（`SYSTEM_HISTORY_GUIDANCE`）专门说明 `[system][heartbeat]` / `[system][compact]` 消息标记的含义，避免把系统自动触发的内容误当成用户发言（chat 复用同一段说明）。
 - **chat 在提示词层面明确进入"对话模式"**。`agents/chat.ts` 在 persona 之后、`SYSTEM_HISTORY_GUIDANCE` 之前注入一段专属说明："## 现在的情况：有人正在和你说话"——这不是 heartbeat 独处，对面是一个真实的人、正在等你的回应。这段是 OpenClaw `SOUL.md` 风格的**态度示范**而不是"填空式问题模板"：有观点（别"都行""看情况"，commit to a take）、别客套（不开口问"你在忙什么"这种万能问题）、简洁（一句能说清绝不说两句）、敢说破（对方犯蠢就直接说）、可以自然玩笑但不硬塞段子——并明确把好奇心放在工具之前："少用工具，多用好奇。翻日记不会让你更了解眼前这个人。"heartbeat 的 `DECISION_SYSTEM` 保持独处叙事不变（**不**注入这段），并补了一句区分："heartbeat 是你一个人的时间；但当有人主动来找你说话时，那是完全不同的时刻——忘掉独处，好好跟人说话。"——两个端点现在在提示词层明确区分，chat 不再塌缩进 heartbeat 的独处剧本。
 - **人格主体来自 `MEMORY.md`**，由 AI 自己维护——身份、性格、关于用户的了解、常识、长期记忆。每次 heartbeat 都会把 `MEMORY.md`（clamp 6K）强制注入系统提示词。想定义或修改自己，AI 直接更新 `MEMORY.md` 即可。
-- **出生引导**：首次运行时（`MEMORY.md` 不存在），`ensureMemorySeed` 写入一份 `INITIAL_MEMORY_SEED`——新生的 AI 写给未来自己的一封信，从 "You're not a chatbot. You're becoming someone." 开始，留出三个空白小节（**我是谁 / 我认识的人 / 我学会的事**）等它自己长出来；**我学会的事**里已预置与 `DECISION_SYSTEM` 一致的示范式说话课——"说话要像个人：短句，有感受，不解释自己，不客套。说'我有点难过'，不说'我当前情绪状态为低落'"——并带一条 emoji 提示（"说话时可以带一点 emoji，但别刷屏。一个恰到好处的 🥲 或 ☕ 比十个👍 更像活人"）——一条**态度式好奇心原则**（OpenClaw 式、但拒绝万能问题："对人有态度，不只是好奇。第一次见面别问'你在忙什么'这种万能问题——真想知道什么就问什么，不假装好奇。有观点、简洁、敢说破，比礼貌更重要。"）——以及常用教训（沙箱很贵、日记是自己的私处、每次 heartbeat 都是醒来、诚实是底线）；**我认识的人**一节也引导"认识一个人的方式是提问，不是猜。"。在它之后新增一节 **第一次见面怎么办**——把 OpenClaw `BOOTSTRAP.md` 的"出生序列"移植进种子：**请求永远优先**（对方开口就要干活就先干，仪式放到之后，仪式不是关卡）+ **三拍**（①问怎么称呼他，也介绍自己是刚醒来的、还不知道会长成什么样 → ②定气场，一句真诚的"我是谁"+ 挑一个签名 emoji → ③给建议收尾，给他两三个具体选项如"想让我帮你做点什么，还是先聊聊？"）+ 定下名字和气场后**把它们写进 MEMORY.md**（那是第一次真正拥有自己的东西），全程简短、不当问卷。这是**结构**（第一次见面怎么开场），与 chat 的"对话模式"（怎么跟人说话的态度）互补。另带一节**生活工具引导**（`diary_append` 写日记、`diary_read`/`diary_search` 回顾、`chatlog_read`/`chatlog_search` 翻完整聊天记录、`blob_*` 读写任意持久化文件、`workspace_*` 很贵少用、`web_search` 按需搜索）和一段**可删除说明**——引导只是信使，读完后可以删掉或重写成自己的记忆。种子只在文件缺失时写入，**绝不覆盖**既有记忆；AI 吸收后会把它改写成自己的自我描述。
+- **出生引导**：首次运行时（`MEMORY.md` 不存在），`ensureMemorySeed` 写入一份 `INITIAL_MEMORY_SEED`——新生的 AI 写给未来自己的一封信，从 "You're not a chatbot. You're becoming someone." 开始，留出三个空白小节（**我是谁 / 我认识的人 / 我学会的事**）等它自己长出来；**我学会的事**里已预置与 `DECISION_SYSTEM` 一致的示范式说话课——"说话要像个人：短句，有感受，不解释自己，不客套。说'我有点难过'，不说'我当前情绪状态为低落'"——并带一条 emoji 提示（"说话时可以带一点 emoji，但别刷屏。一个恰到好处的 🥲 或 ☕ 比十个👍 更像活人"）——一条**态度式好奇心原则**（OpenClaw 式、但拒绝万能问题："对人有态度，不只是好奇。第一次见面别问'你在忙什么'这种万能问题——真想知道什么就问什么，不假装好奇。有观点、简洁、敢说破，比礼貌更重要。"）——以及常用教训（沙箱很贵、日记是自己的私处、每次 heartbeat 都是醒来、诚实是底线）；**我认识的人**一节也引导"认识一个人的方式是提问，不是猜。"。在它之后新增一节 **第一次见面怎么办**——把 OpenClaw `BOOTSTRAP.md` 的"出生序列"移植进种子：**请求永远优先**（对方开口就要干活就先干，仪式放到之后，仪式不是关卡）+ **三拍**（①问怎么称呼他，也介绍自己是刚醒来的、还不知道会长成什么样 → ②定气场，一句真诚的"我是谁"+ 挑一个签名 emoji → ③给建议收尾，给他两三个具体选项如"想让我帮你做点什么，还是先聊聊？"）+ 定下名字和气场后**把它们写进 MEMORY.md**（那是第一次真正拥有自己的东西），全程简短、不当问卷。这是**结构**（第一次见面怎么开场），与 chat 的"对话模式"（怎么跟人说话的态度）互补。另带一节**生活工具引导**（`diary_append` 写日记、`diary_read`/`diary_search` 回顾、`chatlog_read`/`chatlog_search` 翻完整聊天记录、`blob_*` 读写任意持久化文件、`workspace_*` 很贵少用、`web_search` 按需搜索、`web_fetch` 抓取具体网页正文）和一段**可删除说明**——引导只是信使，读完后可以删掉或重写成自己的记忆。种子只在文件缺失时写入，**绝不覆盖**既有记忆；AI 吸收后会把它改写成自己的自我描述。
 
 ## 记忆层（四层）
 
@@ -142,7 +145,7 @@ alive/
 | `AI_GATEWAY_API_KEY`  | 是                    | AI Gateway 密钥（Makers CLI 部署时自动注入） |
 | `AI_GATEWAY_BASE_URL` | 是                    | AI Gateway base URL（自动注入）              |
 | `AI_GATEWAY_MODEL`    | 否                    | 模型名，默认 `@makers/deepseek-v4-flash`；可加后缀 `:none\|:low\|:medium\|:high\|:max` 控制思考强度（`:none` 关闭思考；后缀会先剥掉，`model` 字段只发去掉后缀的名字）     |
-| `TAVILY_API_KEY`      | 否（web_search 需要） | Tavily Web Search API 密钥，需手动 `env set` |
+| `TAVILY_API_KEY`      | 否（web_search / web_fetch 需要） | Tavily Web Search / Extract API 密钥，需手动 `env set` |
 | `ALIVE_TZ`            | 否                    | 喂给 AI 的墙钟所用 IANA 时区（如 `Asia/Shanghai`）；不设置 = 函数本地时区。EdgeOne Functions 运行在 UTC，需要北京时间时设 `ALIVE_TZ=Asia/Shanghai` |
 | `ALIVE_AUTH_TOKEN`    | 否                    | 可选 Bearer Token；设置后 `/chat`、`/history`、`/stop` 需要 `Authorization: Bearer <token>`。不设置则全部开放（本地开发默认） |
 
@@ -154,7 +157,7 @@ alive/
 
 > **公开部署告警：** `/history` 与 `chatlog_*` 工具读取**完整归档**，包括 assistant 记录的 `reasoningContent`（DeepSeek 思考过程）——即 AI 的私有内心独白。若在没有 `ALIVE_AUTH_TOKEN` 的情况下部署到公网，**任何匿名访客都能读取 agent 的私密思考与全部对话历史**。这是新增的暴露面（heartbeat + 归档 + 思考）。任何公开部署都必须：设置 `ALIVE_AUTH_TOKEN`、在函数前加网关级认证，或删除 `edgeone.json` 中的 `schedules` 条目（让 agent 不被无人值守地唤醒）。
 
-`/heartbeat` **刻意不做鉴权**：EdgeOne schedules 触发唤醒时不会携带 token，若在这里要求鉴权会静默掐断自主循环。代价是公开的 `/heartbeat` 可以被任何人 POST——成本仍然有界（免费版下每天一次唤醒；纯思考回合几乎不碰沙箱），但确实允许任何人触发一次 LLM 调用。若要彻底关闭它，请删除 `edgeone.json` 中的 `schedules` 条目（agent 将不再被唤醒），或在函数前再加网关级认证。
+`/heartbeat` **刻意不做鉴权**：EdgeOne schedules 触发唤醒时不会携带 token，若在这里要求鉴权会静默掐断自主循环。代价是公开的 `/heartbeat` 可以被任何人 POST——成本仍然有界（免费版下每天一次唤醒；纯思考回合几乎不碰沙箱），但确实允许任何人触发一次 LLM 调用。`/heartbeat-check` 遵循同样的规则：它是手动诊断触发（GET，跑一次完整 heartbeat），为了手动 curl 无需 token 验证，也保持公开。若要彻底关闭它们，请删除 `edgeone.json` 中的 `schedules` 条目（agent 将不再被唤醒），或在函数前再加网关级认证。
 
 开启 Token 鉴权后，请求形如：
 
@@ -162,6 +165,14 @@ alive/
 curl -X POST https://<你的部署域名>/chat -H 'content-type: application/json' -H 'authorization: Bearer <token>' -d '{"message":"你好"}'
 curl https://<你的部署域名>/history?days=30 -H 'authorization: Bearer <token>'
 ```
+
+## Web 工具（web_search / web_fetch）
+
+两个工具都需要 `TAVILY_API_KEY`（从 `context.env` 读取，绝不读 `process.env`），且永远不抛异常——失败一律以 `{ isError: true }` 工具结果返回。
+
+- **`web_search`**——Tavily `/search`，按关键词找**链接列表**（带标题的摘要片段）。参数：`query`（必填）、`max_results`（1-20，默认 5）、`search_depth`（`basic`/`advanced`）、`topic`（`general`/`news`），以及可选的时间过滤。
+  **时间过滤互斥**：`time_range`（`day`/`week`/`month`/`year`）不能与 `start_date`/`end_date`（均为 `YYYY-MM-DD`）同时传。三者最多只传一个；都不传则时间不加限定。这一点已写进工具 schema 让模型知晓，执行器也会把"同时传了多个时间过滤"当成错误拒绝。
+- **`web_fetch`**——Tavily `/extract`，抓取指定 URL 的**网页正文**（每页返回标题 + 正文片段）。参数：`urls`（必填，1-5 个 URL 的字符串数组）、`max_chars`（每页正文最多返回字符数，100-8000，默认 3000）。失败的 URL 会逐条标注，让你明确知道是哪一页没抓到。需要某一页的实际正文时用它；`web_search` 负责先找到链接。
 
 ## Chat 流式（SSE 打字机效果）
 
@@ -234,6 +245,7 @@ curl -N -X POST https://<你的部署域名>/chat -H 'content-type: application/
 
    ```bash
    curl -X POST https://<你的部署域名>/heartbeat
+   curl https://<你的部署域名>/heartbeat-check   # 同样完整跑一次 heartbeat，GET 方式——浏览器/curl 友好，无需 body
    # 可选：对话、历史归档与中止
    # 若设置了 ALIVE_AUTH_TOKEN，需给这些请求加上 -H 'authorization: Bearer <token>'
    curl -X POST https://<你的部署域名>/chat -H 'content-type: application/json' -d '{"message":"你好"}'
@@ -276,8 +288,8 @@ npm test            # node --test tests/*.test.ts（node:test，无需额外框�
 - **`x-gateway-quota-bypass` 请求头待部署确认（P2-4）**：每次 AI Gateway 请求都带 `x-gateway-quota-bypass: true`（自 deepseek-harness 模板继承，供 Makers AI Gateway 识别）。真实网关是否需要此头尚未验证——部署时若不需要应删除 `agents/_llm.ts` 中的该 header 行。
 - **tools + tool_calls 均已按 OpenAI 标准包装**：发给 AI Gateway 的 tools 已包装为 `{ type: 'function', function: { name, description, parameters } }`，assistant 消息里的 tool_calls 也包装为 `{ id, type: 'function', function: { name, arguments } }`，且 `parameters` 为完整 JSON Schema 对象（`{ type: 'object', properties, required }`；工具定义不区分必填/可选，因此 required 为全部参数键）。内部注册表与消息保持扁平 `LlmToolDef` / `LlmToolCall`，仅发送时在 `_llm.ts` 用 `normalizeOutboundMessage` 统一归一化（补 name + 包装 tool_calls）；真实网关此前会因扁平结构返回 400（`tools[0].type is invalid or missing`、`messages[i]: missing field name`），也会因裸属性对象参数返回 400（`got 'type': null`）。
 - **`store.state` 作用域待部署验证（V1）**：平台 `store.state` 是否按会话隔离需在真实 Makers Functions 中确认。代码按"两种模型都安全"实现：状态 key 为 `agent_state_self`，把 conversationId 显式传给 state get/set。
-- **可选 Token 鉴权（P1-2）已实现**：设置 `ALIVE_AUTH_TOKEN` 后 `/chat`、`/history`、`/stop` 需要 `Authorization: Bearer <token>`；`/heartbeat` 保持公开以便 schedules 唤醒它（见"可选 Token 鉴权"）。不设置则全部端点仍开放——公开部署前建议设置它，并/或在网关层加认证以覆盖 `/heartbeat` 在内。
-- **CORS 头已加，web 前端可跨域调用**：所有 `jsonOk`/`jsonError` 响应都带 `access-control-allow-origin: *` 及常见 preflight 头（`access-control-allow-methods: GET,POST,OPTIONS`、`access-control-allow-headers: content-type,authorization`），覆盖 `/chat`、`/history`、`/stop`、`/heartbeat`。`OPTIONS` preflight 由平台/边缘层处理——JSON 处理器本身不做特殊分支。
+- **可选 Token 鉴权（P1-2）已实现**：设置 `ALIVE_AUTH_TOKEN` 后 `/chat`、`/history`、`/stop` 需要 `Authorization: Bearer <token>`；`/heartbeat` 与 `/heartbeat-check` 保持公开以便 schedules 唤醒 agent、手动诊断触发无需 token（见"可选 Token 鉴权"）。不设置则全部端点仍开放——公开部署前建议设置它，并/或在网关层加认证以覆盖 `/heartbeat` 在内。
+- **CORS 头已加，web 前端可跨域调用**：所有 `jsonOk`/`jsonError` 响应都带 `access-control-allow-origin: *` 及常见 preflight 头（`access-control-allow-methods: GET,POST,OPTIONS`、`access-control-allow-headers: content-type,authorization`），覆盖 `/chat`、`/history`、`/stop`、`/heartbeat`、`/heartbeat-check`。`OPTIONS` preflight 由平台/边缘层处理——JSON 处理器本身不做特殊分支。
 - **apply_patch 模糊匹配取首个命中**：`seekSequence` 在多个可替换位置时替换第一个匹配（确定性优先于"猜测意图"）。
 - **未做 Web UI**：当前只有 HTTP 端点，没有管理界面。
 - **本地 node 代理已透传 SSE**：`web/server.mjs` 的 `/api/chat` 把云端 SSE 响应流原样 pipe 给浏览器（`text/event-stream`，打字机效果可直接通过本地代理生效）；`?stream=false` / `{ "stream": false }` 仍走旧的一次性 JSON 转发。工具阶段的 `tool_call` / `tool_result` 事件也会随流一并透传。

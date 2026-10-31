@@ -5,7 +5,7 @@
  * (diary_append — timestamped append; diary_read / diary_search — opt-in
  * recall), chatlog retrieval tools (chatlog_search / chatlog_read — the
  * complete, never-compacted conversation archive), workspace tools
- * (sandbox-backed, auto-mirrored to Blob) and the Tavily web_search executor.
+ * (sandbox-backed, auto-mirrored to Blob) and the Tavily web_search/web_fetch executors.
  * A pure-text heartbeat never calls any of them, so it stays sandbox-free.
  */
 import { envString, type MakersContext } from './_shared.ts'
@@ -28,7 +28,7 @@ import {
   workspaceRoot,
   writeWorkspaceFile,
 } from './_workspace-tools.ts'
-import { executeWebSearch } from './_tavily.ts'
+import { executeWebFetch, executeWebSearch } from './_tavily.ts'
 import {
   appendDailyLog,
   dateFromDay,
@@ -406,17 +406,27 @@ const WORKSPACE_TOOLS: Array<{
 
 const SEARCH_TOOL: { name: string; description: string; parameters: Record<string, unknown>; run: (tc: ToolContext, args: Record<string, unknown>) => Promise<{ content: string; isError?: boolean }> } = {
   name: 'web_search',
-  description: 'Search the web via Tavily. Returns titled result snippets. Requires TAVILY_API_KEY.',
+  description: 'Search the web via Tavily. Returns titled result snippets. Requires TAVILY_API_KEY. 时间过滤：time_range（day/week/month/year）与 start_date/end_date 互斥，只能二选一；不传则不限定时间。',
   parameters: {
     query: stringSchema('Search query'),
     max_results: { type: 'number', description: 'Max results 1-20 (default 5)' },
     search_depth: { type: 'string', description: 'basic or advanced' },
     topic: { type: 'string', description: 'general or news' },
-    time_range: { type: 'string', description: 'day/week/month/year' },
-    start_date: { type: 'string', description: 'YYYY-MM-DD' },
-    end_date: { type: 'string', description: 'YYYY-MM-DD' },
+    time_range: { type: 'string', description: 'day/week/month/year（与 start_date/end_date 互斥，二选一，默认不限定时间）' },
+    start_date: { type: 'string', description: 'YYYY-MM-DD（使用 start_date/end_date 时不要再传 time_range，二者互斥）' },
+    end_date: { type: 'string', description: 'YYYY-MM-DD（使用 start_date/end_date 时不要再传 time_range，二者互斥）' },
   },
   run: (tc, args) => executeWebSearch(envString(tc.context, 'TAVILY_API_KEY'), args),
+}
+
+const FETCH_TOOL: { name: string; description: string; parameters: Record<string, unknown>; run: (tc: ToolContext, args: Record<string, unknown>) => Promise<{ content: string; isError?: boolean }> } = {
+  name: 'web_fetch',
+  description: '抓取网页正文内容（Tavily extract），输入 url 列表，返回每页标题+正文片段。需要 TAVILY_API_KEY。适合需要网页正文/特定页面的场景；web_search 适合找链接列表。',
+  parameters: {
+    urls: { type: 'array', description: '1-5 个要抓取的 URL（字符串数组，必填）', items: { type: 'string' } },
+    max_chars: { type: 'number', description: '每页正文最多返回字符数（100-8000，默认 3000）' },
+  },
+  run: (tc, args) => executeWebFetch(envString(tc.context, 'TAVILY_API_KEY'), args),
 }
 
 export interface ToolRegistry {
@@ -426,7 +436,7 @@ export interface ToolRegistry {
 
 /** Build the full registry for a request (e.g. a heartbeat turn). */
 export function buildTools(tc: ToolContext): ToolRegistry {
-  const entries = [...BLOB_TOOLS, ...WORKSPACE_TOOLS, ...DIARY_TOOLS, ...CHATLOG_TOOLS, SEARCH_TOOL]
+  const entries = [...BLOB_TOOLS, ...WORKSPACE_TOOLS, ...DIARY_TOOLS, ...CHATLOG_TOOLS, SEARCH_TOOL, FETCH_TOOL]
   const definitions: LlmToolDef[] = entries.map((entry) => ({
     name: entry.name,
     description: entry.description,
