@@ -87,7 +87,7 @@ import {
   SYSTEM_HISTORY_GUIDANCE,
   type ActiveTurn,
 } from './_memory.ts'
-import { buildTools, formatDeclinedContent } from './_tools.ts'
+import { buildTools, buildToolsAsync, formatDeclinedContent } from './_tools.ts'
 
 // Generous budget for interactive chat: the user is present and can stop the
 // turn, so a long working session (e.g. sandbox exploration) is allowed.
@@ -325,7 +325,7 @@ export async function runChat(
   // the internal signal and surfaces CHAT_TIMEOUT_MESSAGE instead of a silent
   // client-style abort.
   const budget = createTurnBudget(signal, timeoutMs)
-  const tools = buildTools({ context, conversationId, signal: budget.signal })
+  const tools = await buildToolsAsync({ context, conversationId, signal: budget.signal })
   const baseMessages: LlmMessage[] = [
     { role: 'system', content: `${persona}\n\n${CHAT_CONVERSATION_MODE}\n\n${SYSTEM_HISTORY_GUIDANCE}` },
     ...history,
@@ -517,7 +517,7 @@ async function* chatStreamGenerator(
   // request signal so a tool-heavy streaming loop cannot run forever; on
   // expiry the descriptive CHAT_TIMEOUT_MESSAGE error replaces a silent abort.
   const budget = createTurnBudget(signal, timeoutMs)
-  const tools = buildTools({ context, conversationId, signal: budget.signal })
+  const tools = await buildToolsAsync({ context, conversationId, signal: budget.signal })
   // Feature ②: mark the turn active (queued interrupts join the next LLM request).
   await setActiveTurn(context, conversationId, activeTurnMarker())
 

@@ -29,6 +29,7 @@ import {
   writeWorkspaceFile,
 } from './_workspace-tools.ts'
 import { executeWebFetch, executeWebSearch } from './_tavily.ts'
+import { buildMcpTools, cachedMcpClients, discoverMcpClients } from './_mcp.ts'
 import {
   appendDailyLog,
   dateFromDay,
@@ -497,6 +498,21 @@ export function buildTools(tc: ToolContext): ToolRegistry {
     FETCH_TOOL,
     DECLINE_TOOL,
   ]
+  // MCP tools: merged from the per-instance cache (warmed by `buildToolsAsync`
+  // or a prior request). Each tool is namespaced `<server>_<name>` so it can
+  // never shadow a handwritten tool. Never throws — a failed discovery simply
+  // leaves the 20 handwritten tools standing.
+  const usedNames = new Set(entries.map((entry) => entry.name))
+  for (const def of buildMcpTools(cachedMcpClients())) {
+    if (usedNames.has(def.name)) continue
+    usedNames.add(def.name)
+    entries.push({
+      name: def.name,
+      description: def.description,
+      parameters: def.parameters,
+      run: (_tc, args) => def.run(args, _tc.signal),
+    })
+  }
   const definitions: LlmToolDef[] = entries.map((entry) => ({
     name: entry.name,
     description: entry.description,
@@ -517,6 +533,18 @@ export function buildTools(tc: ToolContext): ToolRegistry {
     return tool.run(tc, args)
   }
   return { definitions, run }
+}
+
+/**
+ * Async registry builder for production callers. Warms the MCP client cache
+ * (best-effort — a failed discovery never throws, it just yields the 20
+ * handwritten tools) and then delegates to the synchronous `buildTools`, which
+ * merges the cached MCP tools. Kept separate from `buildTools` so existing
+ * synchronous callers (and the test suite) are untouched.
+ */
+export async function buildToolsAsync(tc: ToolContext): Promise<ToolRegistry> {
+  await discoverMcpClients(tc.context, tc.signal)
+  return buildTools(tc)
 }
 
 

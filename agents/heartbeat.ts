@@ -49,7 +49,7 @@ import {
   SYSTEM_HISTORY_GUIDANCE,
   type ActiveTurn,
 } from './_memory.ts'
-import { buildTools, formatDeclinedContent } from './_tools.ts'
+import { buildToolsAsync, formatDeclinedContent } from './_tools.ts'
 import { snapshotWorkspaceToBlob, workspaceRoot } from './_workspace-tools.ts'
 
 /**
@@ -231,7 +231,7 @@ export async function runHeartbeat(
   // up the sandbox just to snapshot nothing.
   let workspaceToolCalled = false
 
-  const tools = buildTools({
+  const tools = await buildToolsAsync({
     context,
     conversationId,
     signal: controller.signal,
