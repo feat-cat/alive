@@ -3,14 +3,22 @@
  * cover tool execution (P2-1), final-turn tool calls not being dropped (P2-2),
  * and `arguments` arriving as either a JSON string or an object (P2-9).
  */
-import { afterEach, describe, test } from 'node:test'
+import { beforeEach, afterEach, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mock } from 'node:test'
-import { buildChatBody, chatCompletion, degradeVisionMessages, isVisionUnsupportedError, parseGatewayModel, requireGatewayEnv, streamChatCompletion, stripImageContent, TOOL_ONLY_REPLY_NOTE, withProviderMessageName, type LlmMessage, type LlmToolCall } from '../agents/_llm.ts'
+import { buildChatBody, chatCompletion, degradeVisionMessages, isVisionUnsupportedError, parseGatewayModel, requireGatewayEnv, setLlmRetryForTesting, streamChatCompletion, stripImageContent, TOOL_ONLY_REPLY_NOTE, withProviderMessageName, type LlmMessage, type LlmToolCall } from '../agents/_llm.ts'
 import { gatewayEnv, makeContext } from './_helpers.ts'
+
+/** Instant retries for the test suite: retries still happen, but never sleep. */
+const INSTANT_RETRY = { maxRetries: 3, backoffMs: [0, 0, 0] as const }
+
+beforeEach(() => {
+  setLlmRetryForTesting(INSTANT_RETRY)
+})
 
 afterEach(() => {
   mock.restoreAll()
+  setLlmRetryForTesting(null)
 })
 
 describe('withProviderMessageName (DeepSeek strict serde: messages[1] missing field name)', () => {
@@ -1064,6 +1072,204 @@ describe('streamChatCompletion (SSE)', () => {
       }),
       /AI gateway HTTP 503/,
     )
+  })
+})
+
+describe('LLM request auto-retry (transient gateway failures)', () => {
+  test('retries a 429 then succeeds on the third attempt (blocking path)', async () => {
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      if (calls <= 2) return new Response('rate limited', { status: 429 })
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), { status: 200 })
+    })
+
+    const result = await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      maxTurns: 1,
+    })
+
+    assert.equal(calls, 3)
+    assert.equal(result.text, 'ok')
+  })
+
+  test('throws with a retried suffix once 429 retries are exhausted', async () => {
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      return new Response('rate limited', { status: 429 })
+    })
+
+    await assert.rejects(
+      chatCompletion({
+        context,
+        conversationId: 'eo-test',
+        messages: [{ role: 'user', content: 'go' }],
+        maxTurns: 1,
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error)
+        assert.match(error.message, /AI gateway HTTP 429 \(retried 3 times\)/)
+        return true
+      },
+    )
+    assert.equal(calls, 4)
+  })
+
+  test('does not retry a 400 (client error)', async () => {
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      return new Response('bad request', { status: 400 })
+    })
+
+    await assert.rejects(
+      chatCompletion({
+        context,
+        conversationId: 'eo-test',
+        messages: [{ role: 'user', content: 'go' }],
+        maxTurns: 1,
+      }),
+      /AI gateway HTTP 400/,
+    )
+    assert.equal(calls, 1)
+  })
+
+  test('does not retry a 403 (auth error)', async () => {
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      return new Response('forbidden', { status: 403 })
+    })
+
+    await assert.rejects(
+      chatCompletion({
+        context,
+        conversationId: 'eo-test',
+        messages: [{ role: 'user', content: 'go' }],
+        maxTurns: 1,
+      }),
+      /AI gateway HTTP 403/,
+    )
+    assert.equal(calls, 1)
+  })
+
+  test('does not retry an AbortError (user cancel / timeout)', async () => {
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      const abort = new Error('LLM request aborted')
+      abort.name = 'AbortError'
+      throw abort
+    })
+
+    await assert.rejects(
+      chatCompletion({
+        context,
+        conversationId: 'eo-test',
+        messages: [{ role: 'user', content: 'go' }],
+        maxTurns: 1,
+      }),
+      (error: unknown) => error instanceof Error && error.name === 'AbortError',
+    )
+    assert.equal(calls, 1)
+  })
+
+  test('retries a 503 gateway error (blocking path)', async () => {
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      if (calls <= 2) return new Response('busy', { status: 503 })
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'recovered' } }] }), { status: 200 })
+    })
+
+    const result = await chatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      maxTurns: 1,
+    })
+
+    assert.equal(calls, 3)
+    assert.equal(result.text, 'recovered')
+  })
+
+  test('does not retry a network TypeError with the retry suffix on exhaustion', async () => {
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      throw new TypeError('fetch failed')
+    })
+
+    await assert.rejects(
+      chatCompletion({
+        context,
+        conversationId: 'eo-test',
+        messages: [{ role: 'user', content: 'go' }],
+        maxTurns: 1,
+      }),
+      /fetch failed \(retried 3 times\)/,
+    )
+    assert.equal(calls, 4)
+  })
+
+  test('streaming path retries a 429 then succeeds', async () => {
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      if (calls <= 2) return new Response('rate limited', { status: 429 })
+      return sseStreamResponse([sseData({ choices: [{ delta: { content: 'ok' } }] }), 'data: [DONE]\n\n'])
+    })
+
+    const deltas: string[] = []
+    const result = await streamChatCompletion({
+      context,
+      conversationId: 'eo-test',
+      messages: [{ role: 'user', content: 'go' }],
+      onDelta: (delta) => deltas.push(delta),
+    })
+
+    assert.equal(calls, 3)
+    assert.deepEqual(deltas, ['ok'])
+    assert.equal(result.text, 'ok')
+  })
+
+  test('streaming path does not retry after deltas have begun (mid-stream failure propagates)', async () => {
+    let calls = 0
+    mock.method(globalThis, 'fetch', async () => {
+      calls += 1
+      const encoder = new TextEncoder()
+      // Deliver two deltas, then error the stream mid-flight — never retried.
+      let sent = 0
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          sent += 1
+          if (sent <= 2) {
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: sent === 1 ? '前半' : '段' } }] })}\n\n`),
+            )
+          } else {
+            controller.error(new Error('connection reset'))
+          }
+        },
+      })
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+
+    const deltas: string[] = []
+    await assert.rejects(
+      streamChatCompletion({
+        context,
+        conversationId: 'eo-test',
+        messages: [{ role: 'user', content: 'go' }],
+        onDelta: (delta) => deltas.push(delta),
+      }),
+      /connection reset/,
+    )
+    assert.equal(calls, 1)
+    assert.deepEqual(deltas, ['前半', '段'])
   })
 })
 

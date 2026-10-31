@@ -12,11 +12,12 @@
  * output, MEMORY.md seeding on first use, and the system prompt carrying the
  * dynamic wall clock + the AI's memory (never MOOD/ENERGY parse hints).
  */
-import { afterEach, describe, test } from 'node:test'
+import { beforeEach, afterEach, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mock } from 'node:test'
 import { injectBlobStoreForTesting } from '../agents/_blob-tools.ts'
 import { onRequest as heartbeatOnRequest, runHeartbeat, DECISION_SYSTEM } from '../agents/heartbeat.ts'
+import { setLlmRetryForTesting } from '../agents/_llm.ts'
 import { dateKey, INITIAL_MEMORY_SEED } from '../agents/_memory.ts'
 import { SELF_ID, type Env } from '../agents/_shared.ts'
 import { SELF_STATE_KEY, type AgentState } from '../agents/_state.ts'
@@ -28,6 +29,13 @@ import {
   makeMockStore,
   type MockStore,
 } from './_helpers.ts'
+
+/** Instant retries: retries still happen but never sleep. */
+const INSTANT_RETRY = { maxRetries: 3, backoffMs: [0, 0, 0] as const }
+
+beforeEach(() => {
+  setLlmRetryForTesting(INSTANT_RETRY)
+})
 
 function llmTextResponse(content: string): unknown {
   return { choices: [{ message: { content } }] }
@@ -88,6 +96,7 @@ function savedSelfState(store: MockStore): AgentState {
 afterEach(() => {
   mock.restoreAll()
   injectBlobStoreForTesting(null)
+  setLlmRetryForTesting(null)
 })
 
 describe('POST /heartbeat', () => {
@@ -657,5 +666,97 @@ describe('POST /heartbeat', () => {
     assert.ok(written.includes('今天的输出，留进日记。'))
     assert.equal(store.messageLog.length, 2) // wake trigger + assistant reply
     assert.equal(lastLogKind(store), 'heartbeat')
+  })
+})
+
+describe('heartbeat reply-user awareness', () => {
+  /** The newest heartbeat wake trigger in a decision request body. */
+  function newestHeartbeatTrigger(decision: { messages: Array<{ role: string; content: string }> }): string | undefined {
+    const triggers = decision.messages.filter((message) => message.role === 'user' && message.content.includes('heartbeat 醒来'))
+    return triggers[triggers.length - 1]?.content
+  }
+
+  /** Run one heartbeat and return the decision request body + store. */
+  async function runDecisionWith(store: MockStore): Promise<{
+    decision: { messages: Array<{ role: string; content: string }> }
+    bodies: Array<Record<string, unknown>>
+  }> {
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    const context = withGatewayEnv(store)
+    const bodies: Array<Record<string, unknown>> = []
+    mock.method(globalThis, 'fetch', async (_input: unknown, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+      return new Response(JSON.stringify(llmTextResponse('好的，我在。')), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+    await runHeartbeat(context)
+    const decision = bodies[0] as { messages: Array<{ role: string; content: string }> }
+    return { decision, bodies }
+  }
+
+  test('a pending real user message switches the trigger into reply-user mode', async () => {
+    const store = makeMockStore({ [SELF_ID]: { [SELF_STATE_KEY]: defaultSelfState() } })
+    store.addMessage(SELF_ID, { role: 'user', content: '你好，在吗？', metadata: {} })
+    const { decision } = await runDecisionWith(store)
+
+    const trigger = newestHeartbeatTrigger(decision)
+    assert.ok(trigger, 'the wake trigger is present')
+    assert.match(trigger, /现在就回他/)
+    assert.match(trigger, /像聊天一样说话/)
+    assert.match(trigger, /不用写日记/)
+    // The system prompt gains the chat conversation-mode section.
+    const system = decision.messages.find((message) => message.role === 'system')
+    assert.ok(system, 'a system message exists')
+    assert.match(system.content, /有人正在和你说话/)
+  })
+
+  test('a pending assistant reply keeps the solitude trigger and prompt', async () => {
+    const store = makeMockStore({ [SELF_ID]: { [SELF_STATE_KEY]: defaultSelfState() } })
+    store.addMessage(SELF_ID, { role: 'assistant', content: '早前回复', metadata: { logKind: 'chat' } })
+    const { decision } = await runDecisionWith(store)
+
+    const trigger = newestHeartbeatTrigger(decision)
+    assert.ok(trigger, 'the wake trigger is present')
+    assert.match(trigger, /此刻想做什么就做什么/)
+    const system = decision.messages.find((message) => message.role === 'system')
+    assert.ok(system, 'a system message exists')
+    assert.doesNotMatch(system.content, /有人正在和你说话/)
+  })
+
+  test('skips prior heartbeat triggers to find the real user message beneath them', async () => {
+    const store = makeMockStore({ [SELF_ID]: { [SELF_STATE_KEY]: defaultSelfState() } })
+    store.addMessage(SELF_ID, { role: 'user', content: '（heartbeat 醒来）此刻想做什么就做什么。', metadata: { kind: 'heartbeat' } })
+    store.addMessage(SELF_ID, { role: 'assistant', content: '早前心跳输出', metadata: { kind: 'heartbeat' } })
+    store.addMessage(SELF_ID, { role: 'user', content: '你看到我的消息了吗？', metadata: {} })
+    const { decision } = await runDecisionWith(store)
+
+    const trigger = newestHeartbeatTrigger(decision)
+    assert.ok(trigger, 'the wake trigger is present')
+    // The newest trigger is reply-user even though older heartbeat rows sit above
+    // the real user message — structural heartbeat rows are skipped.
+    assert.match(trigger, /现在就回他/)
+    const system = decision.messages.find((message) => message.role === 'system')
+    assert.ok(system, 'a system message exists')
+    assert.match(system.content, /有人正在和你说话/)
+  })
+
+  test('a pending image-user message also counts as a real user message', async () => {
+    const store = makeMockStore({ [SELF_ID]: { [SELF_STATE_KEY]: defaultSelfState() } })
+    store.addMessage(SELF_ID, {
+      role: 'user',
+      content: JSON.stringify([
+        { type: 'text', text: '看看这张图' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
+      ]),
+      metadata: { kind: 'image-user', hasImage: true },
+    })
+    const { decision } = await runDecisionWith(store)
+
+    const trigger = newestHeartbeatTrigger(decision)
+    assert.ok(trigger, 'the wake trigger is present')
+    assert.match(trigger, /现在就回他/)
   })
 })

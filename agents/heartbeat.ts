@@ -22,6 +22,7 @@
 import {
   PLAY_TURN_TIMEOUT_MS,
   SELF_ID,
+  STORE_READ_LIMIT,
   asMakersContext,
   errorResponse,
   jsonOk,
@@ -29,8 +30,9 @@ import {
   type MakersContext,
 } from './_shared.ts'
 import { chatCompletion, type ChatResult } from './_llm.ts'
+import { CHAT_CONVERSATION_MODE } from './chat.ts'
 import { buildPersona, humanNowText, readTimeZone } from './_persona.ts'
-import { getState, updateState } from './_state.ts'
+import { getState, updateState, type AgentState } from './_state.ts'
 import {
   appendDailyLog,
   appendLog,
@@ -106,6 +108,61 @@ export const DECISION_SYSTEM = [
 ].join('\n')
 
 /**
+ * Reply-user trigger opening line: the heartbeat wakes into a real user
+ * message that has not been answered yet, so it must talk like a chat turn
+ * (no diary, no wandering).
+ */
+const REPLY_USER_TRIGGER_OPENING =
+  '（heartbeat 醒来）有人刚给你发过消息还没等到回复——现在就回他。像聊天一样说话，不用写日记，不用闲逛。'
+
+/** Solitude trigger opening line (unchanged behaviour when nobody is waiting). */
+const SOLITUDE_TRIGGER_OPENING = '（heartbeat 醒来）此刻想做什么就做什么。'
+
+/**
+ * Build the heartbeat trigger message. In reply-user mode the opening line
+ * switches to "answer the person waiting" and the closing guidance tells the
+ * AI to talk rather than act alone; otherwise the existing solitude narrative
+ * is preserved verbatim.
+ */
+function buildHeartbeatTrigger(state: AgentState, replyMode: boolean): string {
+  const opening = replyMode ? REPLY_USER_TRIGGER_OPENING : SOLITUDE_TRIGGER_OPENING
+  const guidance = replyMode
+    ? '他还在等你的话。用聊天的方式回应，别一个人发呆，也别翻日记。'
+    : '如果你的决定需要工具，直接调用它们。'
+  return [
+    opening,
+    '',
+    '## 现状',
+    `- 距上次活动：${timeAgo(state.lastActivityAt)}`,
+    '',
+    guidance,
+  ].join('\n')
+}
+
+/**
+ * True when the most recent non-structural store row is a REAL user message
+ * (someone is waiting for a reply). Heartbeat wake triggers (kind:'heartbeat')
+ * and compact summaries (kind:'summary') are skipped — they are system
+ * structural rows, not user behaviour. An image-bearing user row
+ * (kind:'image-user') counts as a real user message. A read failure degrades
+ * to `false` (keep the solitude behaviour).
+ */
+async function hasPendingUserMessage(context: MakersContext, conversationId: string): Promise<boolean> {
+  if (!context.store) return false
+  try {
+    const messages = await context.store.getMessages({ conversationId, limit: STORE_READ_LIMIT, order: 'desc' })
+    for (const message of messages) {
+      const kind = (message.metadata as { kind?: unknown } | undefined)?.kind
+      if (kind === 'heartbeat' || kind === 'summary') continue
+      return message.role === 'user'
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
+/**
  * One free-form heartbeat: perception → one bounded LLM loop with the full
  * tool registry → wrap-up (snapshot workspace if it was touched, update
  * lastActivityAt, append the actual output as a log).
@@ -122,18 +179,18 @@ export async function runHeartbeat(
   // Auto-compact the context store before reading the history.
   await maybeCompact(context, conversationId)
 
+  // Reply-user awareness: check whether the last non-structural store row is a
+  // real user message still waiting for an answer. Runs BEFORE the wake trigger
+  // is appended so it never sees this heartbeat's own row.
+  const replyMode = await hasPendingUserMessage(context, conversationId)
+
   // Every wake-up appends a marked user/trigger message into the shared
   // history, then the model gets the whole store as a STANDARD messages array
   // ([system(persona + decision), ...history]). The trigger entry is already
-  // part of `history`, so the AI perceives its own wake as a normal turn.
-  const trigger = [
-    '（heartbeat 醒来）此刻想做什么就做什么。',
-    '',
-    '## 现状',
-    `- 距上次活动：${timeAgo(state.lastActivityAt)}`,
-    '',
-    '如果你的决定需要工具，直接调用它们。',
-  ].join('\n')
+  // part of `history`, so the AI perceives its own wake as a normal turn. In
+  // reply-user mode the trigger switches to "answer the person waiting" and
+  // the system prompt gains the chat conversation-mode section.
+  const trigger = buildHeartbeatTrigger(state, replyMode)
   await persistHistory(context, conversationId, 'user', trigger, {
     kind: 'heartbeat',
     metadata: { kind: 'heartbeat' },
@@ -186,7 +243,10 @@ export async function runHeartbeat(
       context,
       conversationId,
       messages: [
-        { role: 'system', content: `${persona}\n\n${DECISION_SYSTEM}` },
+        {
+          role: 'system',
+          content: `${persona}\n\n${DECISION_SYSTEM}${replyMode ? `\n\n${CHAT_CONVERSATION_MODE}` : ''}`,
+        },
         ...history,
       ],
       tools: tools.definitions,

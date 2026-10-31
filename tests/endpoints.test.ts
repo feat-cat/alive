@@ -7,15 +7,23 @@
  * `globalThis.fetch` is mocked to simulate the AI Gateway. All mocks are
  * restored in `afterEach`.
  */
-import { afterEach, describe, test } from 'node:test'
+import { beforeEach, afterEach, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mock } from 'node:test'
 import { onRequest as chatOnRequest, runChat } from '../agents/chat.ts'
 import { onRequest as stopOnRequest, runStop } from '../agents/stop.ts'
 import { CHAT_TIMEOUT_MESSAGE, errorResponse, SELF_ID, type Env } from '../agents/_shared.ts'
+import { setLlmRetryForTesting } from '../agents/_llm.ts'
 import { injectBlobStoreForTesting } from '../agents/_blob-tools.ts'
 import { dateKey } from '../agents/_memory.ts'
 import { gatewayEnv, makeContext, makeMockBlobStore, makeMockStore } from './_helpers.ts'
+
+/** Instant retries: retries still happen but never sleep. */
+const INSTANT_RETRY = { maxRetries: 3, backoffMs: [0, 0, 0] as const }
+
+beforeEach(() => {
+  setLlmRetryForTesting(INSTANT_RETRY)
+})
 
 function llmTextResponse(content: string): unknown {
   return { choices: [{ message: { content } }] }
@@ -40,6 +48,7 @@ function mockGateway(...payloads: unknown[]): { calls: number } {
 afterEach(() => {
   mock.restoreAll()
   injectBlobStoreForTesting(null)
+  setLlmRetryForTesting(null)
 })
 
 describe('POST /chat', () => {
@@ -972,6 +981,62 @@ describe('POST /chat', () => {
     assert.equal(res.status, 500) // errorResponse maps the gateway 400 to a stable 500
     const body = (await res.json()) as { ok: boolean; error: string }
     assert.match(body.error, /AI gateway HTTP 400/)
+  })
+
+  test('LLM failure archives an error chatlog record and never writes it to the store (JSON path)', async () => {
+    const store = makeMockStore()
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    mock.method(globalThis, 'fetch', async () => new Response('boom', { status: 503 }))
+
+    const res = await chatOnRequest(makeContext({
+      store,
+      env: gatewayEnv() as Env,
+      body: { message: '你好', stream: false },
+    }))
+    assert.equal(res.status, 500)
+    const body = (await res.json()) as { ok: boolean; error: string }
+    assert.match(body.error, /AI gateway HTTP 503/)
+
+    // The failure is archived to the chatlog with kind:'error' so /history shows it.
+    const chatlog = (blob.blobMap.get(`chatlog/${dateKey(new Date())}.jsonl`) ?? '')
+      .split('\n')
+      .filter((line) => line.trim())
+      .map((line) => JSON.parse(line) as { role: string; kind: string; content: string })
+    const errorRecord = chatlog.find((record) => record.kind === 'error')
+    assert.ok(errorRecord, 'an error record is archived into the chatlog')
+    assert.match(errorRecord?.content ?? '', /这次回复失败了/)
+    assert.match(errorRecord?.content ?? '', /AI gateway HTTP 503/)
+
+    // The store keeps ONLY the user message — the AI context never sees the error noise.
+    assert.equal(store.messageLog.length, 1)
+    assert.equal(store.messageLog[0]?.role, 'user')
+    assert.equal(store.messageLog[0]?.content, '你好')
+  })
+
+  test('LLM failure archives an error chatlog record on the streaming path too', async () => {
+    const store = makeMockStore()
+    const blob = makeMockBlobStore()
+    injectBlobStoreForTesting(blob)
+    mock.method(globalThis, 'fetch', async () => new Response('boom', { status: 503 }))
+
+    const res = await chatOnRequest(makeContext({ store, env: gatewayEnv() as Env, body: { message: '你好' } }))
+    assert.equal(res.status, 200) // SSE transports errors inside the stream
+    const bodyText = await res.text()
+    assert.ok(bodyText.includes('"type":"error_message"'))
+    assert.ok(bodyText.includes('AI gateway HTTP 503'))
+
+    const chatlog = (blob.blobMap.get(`chatlog/${dateKey(new Date())}.jsonl`) ?? '')
+      .split('\n')
+      .filter((line) => line.trim())
+      .map((line) => JSON.parse(line) as { kind: string; content: string })
+    const errorRecord = chatlog.find((record) => record.kind === 'error')
+    assert.ok(errorRecord, 'an error record is archived into the chatlog')
+    assert.match(errorRecord?.content ?? '', /这次回复失败了/)
+
+    // Store has only the user row (no assistant, no error row).
+    assert.equal(store.messageLog.length, 1)
+    assert.equal(store.messageLog[0]?.role, 'user')
   })
 
   test('P1-2: the streaming turn winds down once the cumulative tool-result budget is spent', async () => {

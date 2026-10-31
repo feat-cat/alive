@@ -118,7 +118,7 @@ const IMAGE_DATA_URL_RE = /^data:image\/[a-z0-9.+-]+;base64,/i
  * blank question template: commit to a take, skip the pleasantries, stay
  * terse, call out nonsense — and prefer curiosity over tools.
  */
-const CHAT_CONVERSATION_MODE = [
+export const CHAT_CONVERSATION_MODE = [
   '## 现在的情况：有人正在和你说话',
   '这不是 heartbeat 独处，不是系统定时唤醒——是有人主动来找你了。',
   '对面是一个真实的人，正在等你的回应。',
@@ -298,6 +298,10 @@ export async function runChat(
     return { reply, conversationId, now: nowIso() }
   } catch (error) {
     if (budget.expired()) throw chatTimeoutError()
+    // A genuine LLM failure (retries exhausted, gateway 5xx, network) is
+    // archived to the chatlog so the user can see it in /history; a user
+    // abort / wall-clock timeout never archives.
+    if (!isAbortError(error)) await archiveChatErrorBestEffort(context, error)
     throw error
   } finally {
     budget.dispose()
@@ -419,6 +423,10 @@ async function* chatStreamGenerator(
     }
   } catch (error) {
     if (budget.expired()) throw chatTimeoutError()
+    // Genuine LLM failure (retries exhausted, gateway 5xx, network): archive to
+    // the chatlog so the user can see it in /history; a user abort / wall-clock
+    // timeout never archives. The error still propagates to the SSE transport.
+    if (!isAbortError(error)) await archiveChatErrorBestEffort(context, error)
     throw error
   } finally {
     budget.dispose()
@@ -638,6 +646,32 @@ async function archiveChatlogBestEffort(
   } catch {
     /* best-effort: the store/SSE flow never depends on the archive */
   }
+}
+
+/** Short, stable error summary for the archived failure record (~200 chars). */
+function errorSummary(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error)
+  return raw.length > 200 ? `${raw.slice(0, 200)}…` : raw
+}
+
+/**
+ * Archive a failed LLM turn into the chatlog ONLY (never the store, so the AI
+ * context stays clean — the user's real message remains the last model input).
+ * Best-effort: a Blob failure degrades silently. Distinguishes a genuine LLM
+ * failure from a user abort / wall-clock timeout (those never archive).
+ */
+async function archiveChatErrorBestEffort(context: MakersContext, error: unknown): Promise<void> {
+  const summary = errorSummary(error)
+  await archiveChatlogBestEffort(context, {
+    role: 'system',
+    content: `（这次回复失败了：${summary}。你的消息已收到，我下次醒来或你再来时会看到。）`,
+    kind: 'error',
+  })
+}
+
+/** True for user-initiated aborts (client disconnect) and wall-clock timeouts. */
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError'
 }
 
 /** Best-effort MEMORY.md seed + read: Blob unavailable degrades to ''. */

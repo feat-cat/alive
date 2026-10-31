@@ -454,6 +454,169 @@ export function safeParseArguments(raw: string | Record<string, unknown>): Recor
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* Auto-retry on transient gateway failures (429 / 5xx / network)      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Maximum automatic retries for a single LLM request. One attempt + up to 3
+ * retries = 4 total tries before the last error is surfaced to the caller.
+ */
+export const LLM_RETRY_MAX = 3
+
+/**
+ * Fixed backoff schedule (ms) between retries, indexed by the retry ordinal:
+ * 1st retry waits 2s, 2nd 5s, 3rd 10s. A response `Retry-After` header, when
+ * present, overrides the fixed schedule for that specific retry. Tests inject
+ * `[0, 0, 0]` via `setLlmRetryForTesting` so the suite never really sleeps.
+ */
+export const LLM_RETRY_BACKOFF_MS = [2000, 5000, 10000] as const
+
+/** Retry policy consumed by every LLM request (defaults exported above). */
+export interface LlmRetryPolicy {
+  maxRetries: number
+  backoffMs: readonly number[]
+}
+
+let activeRetryPolicy: LlmRetryPolicy = {
+  maxRetries: LLM_RETRY_MAX,
+  backoffMs: LLM_RETRY_BACKOFF_MS,
+}
+
+/**
+ * Test seam: replace the active retry policy (e.g. `{ maxRetries: 3,
+ * backoffMs: [0, 0, 0] }`) so retries are instant, or `null` to restore the
+ * production defaults. Mirrors `injectBlobStoreForTesting` — the production
+ * path never calls this.
+ */
+export function setLlmRetryForTesting(policy: LlmRetryPolicy | null): void {
+  activeRetryPolicy = policy ?? { maxRetries: LLM_RETRY_MAX, backoffMs: LLM_RETRY_BACKOFF_MS }
+}
+
+/** AbortError with the canonical name the transport silences. */
+function abortError(): Error {
+  const abort = new Error('Aborted')
+  abort.name = 'AbortError'
+  return abort
+}
+
+/**
+ * Parse a `Retry-After` header into a wait duration in ms: an integer seconds
+ * value (`Retry-After: 120`) or an HTTP-date (`Retry-After: Wed, 21 Oct 2026
+ * 07:28:00 GMT`). Returns null when the header is absent/unparseable.
+ */
+function parseRetryAfter(value: string | undefined): number | null {
+  const trimmed = value?.trim() ?? ''
+  if (!trimmed) return null
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000
+  const at = Date.parse(trimmed)
+  if (Number.isFinite(at)) {
+    const delay = at - Date.now()
+    return delay > 0 ? delay : 0
+  }
+  return null
+}
+
+/** Error carrying the optional gateway `Retry-After` wait (ms). */
+interface LlmHttpError extends Error {
+  retryAfterMs?: number
+}
+
+/**
+ * Build the canonical gateway error message (`AI gateway HTTP <status>: ...`)
+ * and attach a parsed `Retry-After` wait when the response carried one.
+ */
+function gatewayHttpError(status: number, body: string, retryAfter: string | undefined): Error {
+  const error = new Error(`AI gateway HTTP ${status}${body ? `: ${body.slice(0, 300)}` : ''}`)
+  const retryAfterMs = parseRetryAfter(retryAfter)
+  if (retryAfterMs !== null) (error as LlmHttpError).retryAfterMs = retryAfterMs
+  return error
+}
+
+/**
+ * True when an error is worth retrying: HTTP 429 (rate-limited), HTTP
+ * 500/502/503/504 (gateway transient), or a network-layer fetch failure
+ * (`TypeError`). Client errors (400/401/403/404), AbortError (user cancel /
+ * timeout) and configuration errors (missing env) are NEVER retried.
+ */
+function isRetryableError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  if (error.name === 'AbortError') return false
+  const statusMatch = /^AI gateway HTTP (\d+)/.exec(error.message)
+  if (statusMatch) {
+    const status = Number(statusMatch[1])
+    return status === 429 || status === 500 || status === 502 || status === 503 || status === 504
+  }
+  return error instanceof TypeError
+}
+
+/** Append `(retried N times)` to the error message after retry exhaustion. */
+function withRetrySuffix(error: Error, retried: number): Error {
+  const message = error.message
+  const statusMatch = /^(AI gateway HTTP \d+)/.exec(message)
+  if (statusMatch) {
+    const out = new Error(`${statusMatch[1]} (retried ${retried} times)${message.slice(statusMatch[1].length)}`)
+    out.name = error.name
+    return out
+  }
+  const out = new Error(`${message} (retried ${retried} times)`)
+  out.name = error.name
+  return out
+}
+
+/** Wait `ms` (no-op when 0), aborting immediately if `signal` fires. */
+async function waitForRetry(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (ms <= 0) return
+  await new Promise<void>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const onAbort = () => {
+      if (timer !== undefined) clearTimeout(timer)
+      reject(abortError())
+    }
+    if (signal?.aborted) {
+      reject(abortError())
+      return
+    }
+    timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/**
+ * Run `attempt`, retrying transient failures (`isRetryableError`) up to
+ * `maxRetries` times with the configured backoff (or a `Retry-After` override).
+ * The caller's `signal` is honored between attempts. The last error is rethrown
+ * with a `(retried N times)` suffix once the budget is exhausted.
+ */
+async function withLlmRetry<T>(attempt: () => Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  const policy = activeRetryPolicy
+  let lastError: unknown = null
+  let retried = 0
+  let lastWasRetryable = false
+  for (let attemptIndex = 0; ; attemptIndex += 1) {
+    if (signal?.aborted) throw abortError()
+    try {
+      return await attempt()
+    } catch (error) {
+      lastError = error
+      lastWasRetryable = isRetryableError(error)
+      if (!lastWasRetryable || attemptIndex >= policy.maxRetries) break
+      retried += 1
+      const retryAfterMs = (error as LlmHttpError).retryAfterMs
+      const delay =
+        retryAfterMs ?? policy.backoffMs[attemptIndex] ?? policy.backoffMs[policy.backoffMs.length - 1] ?? 0
+      await waitForRetry(delay, signal)
+    }
+  }
+  if (lastWasRetryable && retried > 0 && lastError instanceof Error) {
+    throw withRetrySuffix(lastError, retried)
+  }
+  throw lastError
+}
+
 async function singleCall(
   context: MakersContext,
   conversationId: string,
@@ -464,6 +627,20 @@ async function singleCall(
   maxTokens: number | undefined,
 ): Promise<{ content: string; reasoning: string; toolCalls: LlmToolCall[] }> {
   const gateway = requireGatewayEnv(context)
+  // `buildChatBody` re-applies the strict-serif normalization (role-derived
+  // `name` + OpenAI-standard `tool_calls` wrappers) exactly as before, so
+  // the upstream payload shape never changes across retries.
+  const body = buildChatBody(gateway, messages, tools, temperature, maxTokens, false)
+  return withLlmRetry(() => singleCallAttempt(gateway, conversationId, body, signal), signal)
+}
+
+/** One non-streaming request attempt; each attempt owns its own timeout. */
+async function singleCallAttempt(
+  gateway: GatewayEnv,
+  conversationId: string,
+  body: Record<string, unknown>,
+  signal: AbortSignal | undefined,
+): Promise<{ content: string; reasoning: string; toolCalls: LlmToolCall[] }> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS)
   if (signal?.aborted) controller.abort()
@@ -471,10 +648,6 @@ async function singleCall(
   signal?.addEventListener('abort', onAbort, { once: true })
 
   try {
-    // `buildChatBody` re-applies the strict-serif normalization (role-derived
-    // `name` + OpenAI-standard `tool_calls` wrappers) exactly as before, so
-    // the upstream payload shape never changes.
-    const body = buildChatBody(gateway, messages, tools, temperature, maxTokens, false)
     const response = await fetch(`${gateway.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: gatewayHeaders(gateway, conversationId, 'application/json'),
@@ -483,7 +656,7 @@ async function singleCall(
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
-      throw new Error(`AI gateway HTTP ${response.status}${text ? `: ${text.slice(0, 300)}` : ''}`)
+      throw gatewayHttpError(response.status, text, response.headers.get('retry-after') ?? undefined)
     }
     const payload = (await response.json()) as RawCompletion
     const message = payload.choices?.[0]?.message
@@ -813,15 +986,31 @@ function buildAccumulatedToolCalls(
 export async function streamChatCompletion(options: StreamChatCompletionOptions): Promise<StreamChatResult> {
   const { context, conversationId, messages, tools, signal, temperature = 0.6, maxTokens, onDelta, onReasoning, onToolCalls } = options
   const gateway = requireGatewayEnv(context)
+  const body = buildChatBody(gateway, messages, tools, temperature, maxTokens, true)
+  // Retry only the fetch + status check: once the gateway accepts the request
+  // (2xx) the stream begins, and a mid-stream failure is NEVER retried — it
+  // propagates to the caller (existing behaviour). Each fetch attempt owns its
+  // own LLM_TIMEOUT_MS timer so a retried request starts fresh.
+  const response = await withLlmRetry(
+    () => streamFetchOnce(gateway, conversationId, body, signal),
+    signal,
+  )
+  if (!response.body) throw new Error('AI gateway streaming response had no body.')
+  return readStreamResponse(response.body, signal, onDelta, onReasoning, onToolCalls)
+}
+
+/** One streaming fetch attempt: POST + status check, own timeout. Returns an OK response. */
+async function streamFetchOnce(
+  gateway: GatewayEnv,
+  conversationId: string,
+  body: Record<string, unknown>,
+  signal: AbortSignal | undefined,
+): Promise<Response> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS)
   if (signal?.aborted) controller.abort()
   const onAbort = () => controller.abort()
   signal?.addEventListener('abort', onAbort, { once: true })
-
-  const body = buildChatBody(gateway, messages, tools, temperature, maxTokens, true)
-  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
-
   try {
     const response = await fetch(`${gateway.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -831,10 +1020,43 @@ export async function streamChatCompletion(options: StreamChatCompletionOptions)
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
-      throw new Error(`AI gateway HTTP ${response.status}${text ? `: ${text.slice(0, 300)}` : ''}`)
+      throw gatewayHttpError(response.status, text, response.headers.get('retry-after') ?? undefined)
     }
-    if (!response.body) throw new Error('AI gateway streaming response had no body.')
-    reader = response.body.getReader()
+    return response
+  } catch (error) {
+    if (controller.signal.aborted) {
+      const abort = new Error('LLM request aborted')
+      abort.name = 'AbortError'
+      throw abort
+    }
+    throw error
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener('abort', onAbort)
+  }
+}
+
+/**
+ * Drain an accepted SSE stream into `onDelta` / `onReasoning` / `onToolCalls`.
+ * Runs under its own LLM_TIMEOUT_MS so a slow stream still has a deadline; a
+ * mid-stream failure throws (no retry — deltas may already have been delivered).
+ */
+async function readStreamResponse(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal | undefined,
+  onDelta: (text: string) => void,
+  onReasoning: ((reasoning: string) => void) | undefined,
+  onToolCalls: ((toolCalls: LlmToolCall[]) => void) | undefined,
+): Promise<StreamChatResult> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS)
+  if (signal?.aborted) controller.abort()
+  const onAbort = () => controller.abort()
+  signal?.addEventListener('abort', onAbort, { once: true })
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+
+  try {
+    reader = body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
     let text = ''
